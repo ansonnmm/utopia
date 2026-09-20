@@ -226,13 +226,16 @@ async fn an_open_statement_shows_under_its_phrase_and_reuses_its_row() -> anyhow
             .expect("a path walks the open statement");
         assert_eq!(direct.edges[0].predicate.as_deref(), Some("acquired"));
 
-        let exported = utopia_store::export::facts_page(&pool, f.kb, None).await?;
+        let exported =
+            utopia_store::export::facts_page(&mut pool.begin().await?, f.kb, None).await?;
         let x = exported
             .iter()
             .find(|x| x.id == fact)
             .expect("export carries it");
         assert_eq!(x.surface_predicate.as_deref(), Some("acquired"));
         assert!(x.predicate_id.is_none());
+        assert_eq!(x.layer, "open");
+        assert_eq!(x.phrase.as_deref(), Some("acquired"));
 
         // 3. 同一句话再听到一次：同一行，证据累积
         let (again, created) = graph::insert_open_statement(

@@ -19,6 +19,8 @@ struct Fixture {
     bare: Uuid,
     kept: Uuid,
     swallowed: Uuid,
+    doc: Uuid,
+    chunk: Uuid,
     deleted_doc: Uuid,
     derived: Uuid,
 }
@@ -208,6 +210,8 @@ async fn seed(pool: &PgPool) -> anyhow::Result<Fixture> {
         bare,
         kept,
         swallowed,
+        doc,
+        chunk,
         deleted_doc,
         derived,
     })
@@ -222,7 +226,7 @@ async fn an_export_reads_the_whole_ledger_not_the_current_view() -> anyhow::Resu
     let f = seed(&pool).await?;
 
     // 1. 事实：撤回的那条**在**。界面把它藏起来是对的，导出把它藏起来就是骗人
-    let facts = utopia_store::export::facts_page(&pool, f.kb, None).await?;
+    let facts = utopia_store::export::facts_page(&mut pool.begin().await?, f.kb, None).await?;
     let ids: Vec<Uuid> = facts.iter().map(|x| x.id).collect();
     assert!(ids.contains(&f.live));
     assert!(
@@ -244,7 +248,8 @@ async fn an_export_reads_the_whole_ledger_not_the_current_view() -> anyhow::Resu
     assert_eq!(bare.surface_predicate.as_deref(), Some("advises"));
 
     // 4. 实体：合并掉的那个是唯一该消失的东西
-    let entities = utopia_store::export::entities_page(&pool, f.kb, None).await?;
+    let entities =
+        utopia_store::export::entities_page(&mut pool.begin().await?, f.kb, None).await?;
     let ids: Vec<Uuid> = entities.iter().map(|e| e.id).collect();
     assert!(ids.contains(&f.kept));
     assert!(
@@ -253,27 +258,52 @@ async fn an_export_reads_the_whole_ledger_not_the_current_view() -> anyhow::Resu
     );
 
     // 5. 文档：删掉的留着墓碑（#268）。抹掉出处等于抹掉证据链
-    let docs = utopia_store::export::documents_page(&pool, f.kb, None).await?;
+    let docs = utopia_store::export::documents_page(&mut pool.begin().await?, f.kb, None).await?;
     let deleted = docs.iter().find(|d| d.id == f.deleted_doc).unwrap();
     assert!(deleted.deleted_at.is_some());
 
-    // 6. 派生：带着规则和前提，审计顺着它走得到断言
-    let derived = utopia_store::export::derived_page(&pool, f.kb, None).await?;
+    // 6. 派生：带着规则和前提，审计顺着它走得到断言。前提按 seq 整行带回——
+    //    断言与派生交错在同一个序位序列里
+    let derived = utopia_store::export::derived_page(&mut pool.begin().await?, f.kb, None).await?;
     let d = derived.iter().find(|d| d.id == f.derived).unwrap();
-    assert_eq!(d.rule, "transitive");
-    assert_eq!(d.premises, vec![f.live]);
+    assert!(d.rule_id.is_some(), "公理规则的身份在 rule_id 上");
+    assert_eq!(d.premises.len(), 1);
+    assert_eq!(d.premises[0].seq, 0);
+    assert_eq!(d.premises[0].fact_id, Some(f.live));
 
     // 7. 词汇表：导入来的类留着原 IRI，公理位照抄
-    let classes = utopia_store::export::classes(&pool, f.kb).await?;
+    let classes = utopia_store::export::classes(&mut pool.begin().await?, f.kb).await?;
     let person = classes.iter().find(|c| c.key == "person").unwrap();
     assert_eq!(person.iri.as_deref(), Some("https://schema.org/Person"));
-    let relations = utopia_store::export::relations(&pool, f.kb).await?;
+    let relations = utopia_store::export::relations(&mut pool.begin().await?, f.kb).await?;
     assert!(relations
         .iter()
         .any(|r| r.key == "works_for" && r.functional));
     assert!(relations
         .iter()
         .any(|r| r.key == "part_of" && r.is_transitive));
+
+    // 8. 段落：出处链的最后一环。定位信息（seq/文档/版本）在，text 不进导出
+    let chunks = utopia_store::export::chunks_page(&mut pool.begin().await?, f.kb, None).await?;
+    let c = chunks.iter().find(|c| c.id == f.chunk).unwrap();
+    assert_eq!(c.document_id, f.doc);
+    assert_eq!(c.seq, 0);
+    assert!(c.superseded_at.is_none());
+
+    // 9. 证据行：配对本身是主键 (fact_id, chunk_id)。事实上的「文档数组 +
+    //    quote 数组」看不出哪句出自哪段；这一行才是绑定关系本身
+    let evidence =
+        utopia_store::export::evidence_page(&mut pool.begin().await?, f.kb, None).await?;
+    let live_ev = evidence.iter().find(|e| e.fact_id == f.live).unwrap();
+    assert_eq!(live_ev.chunk_id, f.chunk);
+    assert_eq!(live_ev.document_id, Some(f.doc));
+    assert_eq!(live_ev.quote.as_deref(), Some("Lin Zhao works for Acme."));
+    let bare_ev = evidence.iter().find(|e| e.fact_id == f.bare).unwrap();
+    assert_eq!(
+        bare_ev.proposed_predicate.as_deref(),
+        Some("advises"),
+        "证据行上模型对谓词的原话要跟着走"
+    );
 
     sqlx::query("DELETE FROM knowledge_bases WHERE id = $1")
         .bind(f.kb)

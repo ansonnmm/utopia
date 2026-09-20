@@ -622,7 +622,8 @@ async fn entity_facts_keeps_identity_values_filters_and_both_clocks() -> anyhow:
     assert!(derived["rule_id"].is_null());
     uuid(&derived["attribute_rule_id"]);
     // The same UUID is the RDF statement's identity, not a newly minted response ID.
-    let exported = utopia_store::export::facts_page(&f.state.pool, f.kb, None).await?;
+    let exported =
+        utopia_store::export::facts_page(&mut f.state.pool.begin().await?, f.kb, None).await?;
     assert!(exported
         .iter()
         .any(|r| r.id == uuid(&corrected["id"]) && r.documents == vec![f.document]));
