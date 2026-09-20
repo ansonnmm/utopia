@@ -59,17 +59,190 @@ source documents, and derivations linked to their rules and premise statements.
 It uses RDF reification, PROV-O and schema.org. This mapping is the compatibility
 boundary: a breaking change needs a decision record explaining why.
 
-Entities, assertions, derivations and documents have UUID-based IRIs:
-`urn:utopia:kb:{kb_id}:entity:{id}`, `…:fact:{id}`, `…:derived:{id}` and
-`…:document:{id}`. The same stored object keeps its identity across exports;
-rebuilding a graph is not an identity-preserving operation. `?base=https://example.org/`
-instead mints `https://example.org/kb/{kb_id}/{kind}/{id}`. Keep the same base when
+Entities, assertions, derivations, documents and chunks have UUID-based IRIs:
+`urn:utopia:kb:{kb_id}:entity:{id}`, `…:fact:{id}`, `…:derived:{id}`,
+`…:document:{id}` and `…:chunk:{id}`. Evidence rows mint
+`…:evidence:{fact_id}:{chunk_id}` from their composite key; time mentions mint
+`…:timemention:{id}` from their own row id. Axiom rules mint
+`…:rule:{id}`; attribute (business) rules mint `…:arule:{id}` — the two rule
+tables are different authorities, and a `rule:` IRI never resolves to an
+attribute rule. Rule conditions mint `…:condition:{rule_id}:{group_seq}:{seq}`
+from their ordering key, and document versions mint
+`…:docversion:{document_id}:{version}` from the `(document, version)` pair the
+locators name. The same stored object keeps its identity across exports;
+rebuilding a graph is not an identity-preserving operation.
+`?base=https://example.org/` instead mints
+`https://example.org/kb/{kb_id}/{kind}/{id}`. Keep the same base when
 joining exports. Imported classes and relations retain their original IRIs.
 
-Ontology export includes explicitly stored `owl:inverseOf` and
-`rdfs:subPropertyOf` links, using the target property's imported IRI or existing
-key-based IRI. It copies declarations within the base; it does not add reciprocal
-links or compute a transitive closure.
+Each evidence row exports as a `utopia:Evidence` node with `utopia:onStatement`
+(the reified assertion it supports), `utopia:fromChunk` (the passage it cites),
+and the stored `utopia:quote`, `utopia:quoteStart`/`utopia:quoteEnd` offsets
+(the quote's byte span inside the cited chunk when recorded),
+`utopia:docVersion`, the row's own `utopia:proposedPredicate` wording when
+recorded, and `prov:wasDerivedFrom`
+document pointer — the pairing is the row, so it is not flattened onto the
+statement. A statement additionally carries the flattened
+`utopia:evidenceOrigin` labels — the distinct `origin` values of its citing
+chunks (e.g. `"pasted"`). Chunks
+export their locator (`schema:isPartOf`, `schema:position`,
+`utopia:charStart`, `utopia:charEnd`, `utopia:heading`, `utopia:docVersion`)
+and their producer metadata (`utopia:origin`, `utopia:originModel`,
+`utopia:anchor` — the anchor exports the stored JSON verbatim),
+not their text. An attribute fact's recorded unit exports as `utopia:unit`
+on the statement node; the relation-level `utopia:unit` remains the declared
+unit, and two observations on the same predicate may differ.
+
+The chunk locator contract: `schema:position` is the zero-based sequence within
+the document's stored version; `utopia:docVersion` says which version the
+offsets address. `utopia:charStart`/`utopia:charEnd` are the **byte** span of
+the chunk's *body* in the normalized document text the chunker ran on — the
+rendered chunk additionally carries a prefix (heading breadcrumb, table
+caption/head) copied from elsewhere in that text, so the span does **not**
+reproduce the rendered chunk text, and chunk text is not part of the export.
+Memory-log entries are a distinct producer: their offsets address the entry's
+own text, counted in characters. Locators identify where the evidence was
+read; byte-exact reconstruction of rendered chunk text is not part of the
+contract.
+
+`utopia:docVersion` on a chunk or evidence node names a row in
+`document_versions` when that row exists: the version exports as a
+`utopia:DocumentVersion` node keyed `(document_id, version)` carrying
+`prov:wasRevisionOf` to the document, `utopia:version`, `utopia:sha256`,
+`utopia:sizeBytes`, `prov:generatedAtTime` (the ingestion stamp) and
+`utopia:recordId`; chunk and evidence locators then also bind to it with
+`utopia:ofVersion`. When no version row exists the numeric locator still
+exports — `(document, doc_version)` is what the locator claims, the version
+node is what makes it resolvable.
+
+Relation vocabulary exports its stored axioms: `owl:inverseOf` and
+`rdfs:subPropertyOf` links, `rdfs:domain`/`rdfs:range` class pointers, the
+declared `utopia:datatype` and `utopia:unit`, the allowed-qualifier list
+(`utopia:allowedQualifier`), characteristic flags (`owl:FunctionalProperty`,
+`owl:InverseFunctionalProperty`, `owl:TransitiveProperty`, `owl:SymmetricProperty`,
+`owl:AsymmetricProperty`, `owl:IrreflexiveProperty`) and `utopia:builtin`.
+Property links copy declarations within the base, using the target property's
+imported IRI or existing key-based IRI — the export does not manufacture
+reciprocal links and does not compute a transitive closure.
+Rules export whole — both axiom rules (`utopia:ruleKind`, `utopia:onPredicate`)
+and attribute rules (subject type, conclusion shape and value/expression) —
+whether or not a derivation currently cites them; a derived statement links its
+rule with `prov:wasGeneratedBy` pointing at `rule:` or `arule:` according to
+which table produced it. Each derivation premise additionally exports a
+`utopia:Premise` node keyed `(derived_id, seq)` carrying `utopia:seq` and
+`prov:used` — premise order is part of the proof.
+
+An attribute rule's antecedent exports as ordered `utopia:RuleCondition` nodes:
+the rule links each with `utopia:condition`, and the node carries the stored
+`utopia:groupSeq`, `utopia:seq`, `utopia:onPredicate` (the attribute the
+condition reads, resolved to its relation IRI), `utopia:op`, the raw
+`utopia:operand` JSON, and `utopia:recordId` for the row's own identity.
+`(group_seq, seq)` is the antecedent's total order — groups disjunct,
+conditions inside a group conjunct. Expression trees — a rule's
+`conclude_expr` and any object-valued condition `operand` — export the stored
+JSON as `utopia:concludeExpr` / `utopia:operand` literals *plus* one
+`utopia:readsPredicate` edge per `{"attr": …}` leaf, resolved to that
+relation's IRI: the literal is the data, the edges are the references. A
+predicate UUID that does not resolve inside the base's vocabulary — cross-base,
+dangling, or not a UUID — refuses the whole export; no dead identifiers are
+emitted.
+
+Assertions export their world-axis anchors `utopia:attestedFrom` /
+`utopia:attestedTo`, the engine-derivation marks `utopia:endDerived` /
+`utopia:ruleDerived`, and qualifier rows flattened onto the statement with the
+qualifier relation's own IRI as predicate (literals typed by the qualifier's
+declared `utopia:datatype`, entity values as entity IRIs). Documents export
+integrity metadata
+(`utopia:sha256`, `schema:encodingFormat`, `utopia:sizeBytes`,
+`utopia:docTimeSource`, `utopia:tag`), lifecycle stamps
+(`prov:generatedAtTime`, `prov:invalidatedAtTime`, `utopia:purgedAt`) and the
+recorded reading context (`utopia:readerNeeded`,
+`utopia:timeContext` verbatim JSON, `utopia:timeContextAt`); chunks
+export `prov:generatedAtTime`, `utopia:extractedAt` and
+`prov:invalidatedAtTime`. Entities export typing provenance
+(`utopia:typeSource`, `utopia:typeResolvedAt`, `utopia:proposedType`,
+`utopia:specificType`), the stored `rdfs:comment` description when present
+and `prov:generatedAtTime`. Classes and relations export their last
+`utopia:updatedAt` stamp — the vocabulary ledger timestamp, not a write
+counter — while every other table's `updated_at` remains operational
+bookkeeping and is not exported.
+
+Every assertion carries its layer: `utopia:statementLayer` is `"typed"` for a
+vocabulary-bound fact and `"open"` for an open statement — an assertion whose
+relation is still the document's own words, not an accepted predicate. An open
+statement exports as `a rdf:Statement` *and* `a utopia:OpenStatement` with no
+`rdf:predicate`; its recorded surface wording arrives as
+`utopia:proposedPredicate` (the wording its evidence recorded), and the stored
+`phrase` exports as `rdfs:label` — the node's human-readable name. A bound fact
+that grew out of one links
+back with `utopia:fromStatement` — typed-fact provenance pointing at the open
+statement it was derived from, whether recorded on the fact's own
+`from_statement_id` or through its `typed_fact_sources` links. When time
+resolution graded an assertion's
+start, `utopia:validFromGrade` exports the grade (`A` stated, `B` resolved
+against the document's anchor, `C` unresolved); a `NULL` grade means the
+boundaries were written, not resolved.
+
+An open statement's own qualifier rows export as `utopia:statementQualifier`
+blank nodes — one per row — typed `utopia:StatementQualifier` with
+`utopia:role` (the document's own role word), and either a
+`utopia:qualifierValue` literal (the stored JSON verbatim) or `prov:value`
+pointing at the entity the qualifier names. Its time mentions export as
+`utopia:TimeMention` nodes linked by `utopia:timeMention`: `utopia:role`,
+`utopia:text` and `utopia:charStart` locate the phrase inside its
+`utopia:onChunk`, `utopia:shape`, `utopia:reference` (verbatim JSON),
+`utopia:granularity` and `utopia:grade` describe what the document's own
+timekeeping said, and `utopia:resolvedFrom`/`utopia:resolvedTo` with their
+`*Precision` companions and `utopia:resolvedAt` carry the resolution — empty
+when the phrase never anchored. The mention node's `prov:generatedAtTime` is
+the row's own ledger stamp.
+
+The whole export is one snapshot: preflight integrity, vocabulary, rules,
+versions, documents, chunks, entities, facts, evidence and derivations are all
+read inside a single `REPEATABLE READ` read-only transaction, so a write that
+commits mid-export can neither insert a dangling reference nor produce a
+half-seen mutation — the file is consistent with one instant of the base.
+
+The export fails closed on broken provenance: if an evidence row or a chunk
+points at an object owned by another base (a state the schema's foreign keys
+alone do not prevent), the route refuses with a deterministic error rather
+than minting the foreign object under this base's IRI or silently dropping
+the row. The same refusal applies when a reference points at a stored object
+that is *not in the exported set* — a merged entity is still in the same base
+but is not emitted, so a fact, derivation or qualifier pointing at one refuses
+the export rather than minting a dangling IRI. The rule surfaces fail the same
+way: a condition whose predicate or owning rule resolves outside the base, a
+document version whose document lives elsewhere, and any `attr` leaf in a
+conclusion or operand expression that cannot be resolved to an exported
+relation all refuse the export. New cross-KB provenance writes
+are rejected at the database level, including batched and COPY restores
+(commit-time checks cover same-table forward references such as `supersedes`
+and `inverse_of`; expression trees embed their predicate UUIDs inside JSONB —
+there is no column to put a foreign key on, so export-side validation is the
+enforcement layer for those references).
+
+Explicit non-claims: operational bookkeeping is not exported — job/queue
+state, extraction progress (`documents.status`, `graph_*`, `extract_epoch`,
+`missing_since`, `chunk_count`, `text_len`, `error`), `updated_at` everywhere
+except the vocabulary tables' exported `utopia:updatedAt`,
+`documents.reader_task` (transient reader state, not the recorded context),
+`documents.source_id` (the `sources` table is an ingest concept, not part of
+the exported ledger), `entities.merged_into`, `entities.attrs` and
+`entities.disambiguator` (merge edges are not asserted facts; attrs are
+extraction scaffolding; the disambiguator is regenerated display text), all
+embedding vectors and their bookkeeping (`*.embedding`, `*.embedded_text`,
+`*.embedded_model`, `entities.profile_embedding`, `entities.profile_n`,
+`chunks.embedding`), vocabulary bookkeeping (`entity_types.color`,
+`entity_types.shape`, `entity_types.created_at`, `relation_types.created_at`,
+`rules.created_at`, `attribute_rules.created_at`, `attribute_rules.updated_at`,
+`attribute_rules.capped_at_last_run`), the review-queue and binding tables
+(`pending_facts`, `rejected_facts`, `type_bindings`, `phrase_bindings` —
+review-time joins, not asserted ledger rows), and the
+`knowledge_bases`/`workspaces`/`organizations`/`sources` container tables
+themselves. Statement nodes carry `prov:wasDerivedFrom` to every citing
+document — the flattened convenience link — while the authoritative
+fact-to-chunk pairing is the `utopia:Evidence` node.
+>>>>>>> 00bb113 (The export contract documents the whole ledger)
 
 MCP remains the agent-facing surface. The structured results below use the same
 UUIDs, so an integration can join a selected result to the exported ledger.
@@ -77,8 +250,8 @@ Ordinary `/api/v1` UI response shapes are **not** a compatibility promise: they
 have no OpenAPI contract or deprecation policy. The export route above is the
 explicit exception, not a promise covering every route with that prefix.
 
-The export does not yet include conflict/review state ([#564](https://github.com/deeplethe/utopia/issues/564))
-or the chunk identity behind a quote. Per-entity export and a SPARQL endpoint are
+The export does not yet include conflict/review state ([#564](https://github.com/deeplethe/utopia/issues/564)).
+Per-entity export and a SPARQL endpoint are
 also not implemented. Neither MCP nor the export promises historical proof
 snapshots: `as_of` selects the derivations held then, but proofs use the current
 premise links. Source-document links are the stored provenance, not a separately
