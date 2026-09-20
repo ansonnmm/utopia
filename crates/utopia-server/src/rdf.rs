@@ -2970,4 +2970,2488 @@ mod tests {
             );
         }
     }
+
+    /// 全量核算：期望 **quad** 集从夹具行
+    /// **独立**推出——不调任何 `emit_*`，连叶子字面量构造都另写一份；
+    /// 序列化器只是被比较的一方。`A == E` 一条式子：多一条、少一条、
+    /// 换一面（IRI/字面量/bnode/**graph_name**——三元组投影会漏过
+    /// named-graph 变种）都算失败。每个声明过的矩阵格——包括实体/事实
+    /// 节点上每条词汇表关系 IRI 那一格——都必须登记，哪怕期望集是空的：
+    /// 漏登记是 oracle 自己的洞，登记了却从没非空过是夹具的洞——`the_fixture_exercises_every_declared_conditional_cell`
+    /// 按 CONDITIONAL_CELLS 逐格断言真假两支都被打过。
+    mod oracle {
+        use super::super::*;
+        use super::{at, chunk, class, derived, fact, id, kb, relation};
+        use oxrdf::{GraphName, NamedOrBlankNode, Quad, Term};
+        use std::collections::{BTreeSet, HashMap, HashSet};
+        use utopia_core::models::FactQualifier;
+        use utopia_store::export::{
+            ExportAttributeRule, ExportDocument, ExportDocumentVersion, ExportEntity,
+            ExportEvidence, ExportPremise, ExportRule, ExportRuleCondition,
+            ExportStatementQualifier, ExportTimeMention,
+        };
+
+        const NOW: &str = "2026-06-01T00:00:00Z";
+
+        fn now() -> DateTime<Utc> {
+            at(NOW)
+        }
+
+        // ---------- 命名与叶子字面量：合约的独立重述 ----------
+        fn mint(kind: &str, ident: &str) -> NamedNode {
+            NamedNode::new(format!("urn:utopia:kb:{}:{kind}:{ident}", kb())).unwrap()
+        }
+
+        fn t_dt(t: DateTime<Utc>) -> Term {
+            Literal::new_typed_literal(
+                t.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                xsd::DATE_TIME,
+            )
+            .into()
+        }
+
+        fn t_str(s: impl Into<String>) -> Term {
+            Literal::new_simple_literal(s.into()).into()
+        }
+
+        fn t_int(i: i64) -> Term {
+            Literal::new_typed_literal(i.to_string(), xsd::INTEGER).into()
+        }
+
+        fn t_dec(c: f32) -> Term {
+            Literal::new_typed_literal(format!("{c:.2}"), xsd::DECIMAL).into()
+        }
+
+        fn t_flag() -> Term {
+            Literal::new_typed_literal("true", xsd::BOOLEAN).into()
+        }
+
+        /// 世界时间按精度落字面值：year→gYear，month→gYearMonth，
+        /// 小时以下→截到秒的 dateTime，其余→date
+        fn t_world(t: DateTime<Utc>, prec: Option<&str>) -> Term {
+            let iso = t.format("%Y-%m-%d").to_string();
+            match prec {
+                Some("year") => Literal::new_typed_literal(iso[..4].to_string(), xsd::G_YEAR),
+                Some("month") => {
+                    Literal::new_typed_literal(iso[..7].to_string(), xsd::G_YEAR_MONTH)
+                }
+                Some("hour" | "minute" | "second") => Literal::new_typed_literal(
+                    t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    xsd::DATE_TIME,
+                ),
+                _ => Literal::new_typed_literal(iso, xsd::DATE),
+            }
+            .into()
+        }
+
+        /// 属性字面值：{"value":…}/{"summary":…}；relative:true → 普通字符串；
+        /// number→decimal, date→date, bool→boolean, 其余→string
+        fn t_value(v: &serde_json::Value, datatype: Option<&str>) -> Term {
+            let raw = v.get("value").unwrap_or(v);
+            let text = match raw {
+                serde_json::Value::String(s) => s.clone(),
+                serde_json::Value::Null => v
+                    .get("summary")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                other => other.to_string(),
+            };
+            let ty = if v.get("relative").and_then(|r| r.as_bool()) == Some(true) {
+                xsd::STRING
+            } else {
+                match datatype {
+                    Some("number") => xsd::DECIMAL,
+                    Some("date") => xsd::DATE,
+                    Some("bool") => xsd::BOOLEAN,
+                    _ => xsd::STRING,
+                }
+            };
+            Literal::new_typed_literal(text, ty).into()
+        }
+
+        /// 算式树里的 attr 叶子（与取数侧 expr_predicate_ids 同一合约的独立实现）
+        fn expr_attrs(v: &serde_json::Value) -> BTreeSet<Uuid> {
+            fn walk(v: &serde_json::Value, out: &mut BTreeSet<Uuid>) {
+                let Some(o) = v.as_object() else { return };
+                if let Some(a) = o.get("attr").and_then(|a| a.as_str()) {
+                    if let Ok(u) = Uuid::parse_str(a) {
+                        out.insert(u);
+                    }
+                } else if o.contains_key("const") {
+                } else if o.contains_key("op") {
+                    if let Some(l) = o.get("l") {
+                        walk(l, out);
+                    }
+                    if let Some(r) = o.get("r") {
+                        walk(r, out);
+                    }
+                }
+            }
+            let mut out = BTreeSet::new();
+            walk(v, &mut out);
+            out
+        }
+
+        // ---------- 矩阵：每种节点声明的谓词格 ----------
+
+        fn nn2(iri: &str) -> NamedNode {
+            NamedNode::new(iri).unwrap()
+        }
+
+        fn fixed_preds(kind: &str) -> &'static [&'static str] {
+            match kind {
+                "entity" => &[
+                    "http://www.w3.org/2000/01/rdf-schema#label",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#comment",
+                    "http://www.w3.org/ns/prov#generatedAtTime",
+                    "urn:utopia:ns:typeSource",
+                    "urn:utopia:ns:typeResolvedAt",
+                    "urn:utopia:ns:proposedType",
+                    "urn:utopia:ns:specificType",
+                ],
+                "fact" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#label",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#subject",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#object",
+                    "urn:utopia:ns:statementLayer",
+                    "urn:utopia:ns:fromStatement",
+                    "urn:utopia:ns:supersedes",
+                    "urn:utopia:ns:proposedPredicate",
+                    "urn:utopia:ns:relativeValue",
+                    "urn:utopia:ns:unit",
+                    "https://schema.org/validFrom",
+                    "urn:utopia:ns:validFromPrecision",
+                    "urn:utopia:ns:validFromGrade",
+                    "https://schema.org/validThrough",
+                    "urn:utopia:ns:validThroughPrecision",
+                    "urn:utopia:ns:endedUnknown",
+                    "urn:utopia:ns:attestedFrom",
+                    "urn:utopia:ns:attestedTo",
+                    "urn:utopia:ns:endDerived",
+                    "urn:utopia:ns:ruleDerived",
+                    "http://www.w3.org/ns/prov#generatedAtTime",
+                    "http://www.w3.org/ns/prov#invalidatedAtTime",
+                    "urn:utopia:ns:confidence",
+                    "http://www.w3.org/ns/prov#wasDerivedFrom",
+                    "urn:utopia:ns:quote",
+                    "urn:utopia:ns:evidenceOrigin",
+                    "urn:utopia:ns:statementQualifier",
+                    "urn:utopia:ns:timeMention",
+                ],
+                "squalifier" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "urn:utopia:ns:role",
+                    "urn:utopia:ns:qualifierValue",
+                    "http://www.w3.org/ns/prov#value",
+                ],
+                "timemention" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "urn:utopia:ns:role",
+                    "urn:utopia:ns:text",
+                    "urn:utopia:ns:charStart",
+                    "urn:utopia:ns:onChunk",
+                    "urn:utopia:ns:shape",
+                    "urn:utopia:ns:reference",
+                    "urn:utopia:ns:granularity",
+                    "urn:utopia:ns:grade",
+                    "urn:utopia:ns:resolvedFrom",
+                    "urn:utopia:ns:resolvedFromPrecision",
+                    "urn:utopia:ns:resolvedTo",
+                    "urn:utopia:ns:resolvedToPrecision",
+                    "urn:utopia:ns:resolvedAt",
+                    "http://www.w3.org/ns/prov#generatedAtTime",
+                ],
+                "derived" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#subject",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#object",
+                    "urn:utopia:ns:derived",
+                    "urn:utopia:ns:unit",
+                    "https://schema.org/validFrom",
+                    "urn:utopia:ns:validFromPrecision",
+                    "https://schema.org/validThrough",
+                    "urn:utopia:ns:validThroughPrecision",
+                    "urn:utopia:ns:endedUnknown",
+                    "http://www.w3.org/ns/prov#generatedAtTime",
+                    "http://www.w3.org/ns/prov#invalidatedAtTime",
+                    "urn:utopia:ns:confidence",
+                    "http://www.w3.org/ns/prov#wasGeneratedBy",
+                    "http://www.w3.org/ns/prov#used",
+                    "urn:utopia:ns:premise",
+                ],
+                "premise" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "urn:utopia:ns:seq",
+                    "http://www.w3.org/ns/prov#used",
+                ],
+                "class" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#label",
+                    "http://www.w3.org/2000/01/rdf-schema#comment",
+                    "urn:utopia:ns:builtin",
+                    "urn:utopia:ns:updatedAt",
+                    "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+                    "urn:utopia:ns:primaryType",
+                    "http://www.w3.org/2002/07/owl#disjointWith",
+                ],
+                "relation" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#label",
+                    "http://www.w3.org/2000/01/rdf-schema#comment",
+                    "urn:utopia:ns:temporal",
+                    "urn:utopia:ns:builtin",
+                    "urn:utopia:ns:updatedAt",
+                    "http://www.w3.org/2002/07/owl#inverseOf",
+                    "http://www.w3.org/2000/01/rdf-schema#subPropertyOf",
+                    "urn:utopia:ns:allowedQualifier",
+                    "http://www.w3.org/2000/01/rdf-schema#domain",
+                    "http://www.w3.org/2000/01/rdf-schema#range",
+                    "urn:utopia:ns:datatype",
+                    "urn:utopia:ns:unit",
+                ],
+                "rule" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#label",
+                    "urn:utopia:ns:ruleKind",
+                    "urn:utopia:ns:onPredicate",
+                ],
+                "arule" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#label",
+                    "urn:utopia:ns:ruleKind",
+                    "http://www.w3.org/2000/01/rdf-schema#comment",
+                    "urn:utopia:ns:conclusion",
+                    "urn:utopia:ns:subjectType",
+                    "urn:utopia:ns:concludesType",
+                    "urn:utopia:ns:concludesPredicate",
+                    "urn:utopia:ns:concludesValue",
+                    "urn:utopia:ns:concludeExpr",
+                    "urn:utopia:ns:readsPredicate",
+                    "urn:utopia:ns:condition",
+                    "urn:utopia:ns:disabled",
+                ],
+                "condition" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "urn:utopia:ns:recordId",
+                    "urn:utopia:ns:groupSeq",
+                    "urn:utopia:ns:seq",
+                    "urn:utopia:ns:onPredicate",
+                    "urn:utopia:ns:op",
+                    "urn:utopia:ns:operand",
+                    "urn:utopia:ns:readsPredicate",
+                ],
+                "document" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#label",
+                    "urn:utopia:ns:sha256",
+                    "https://schema.org/encodingFormat",
+                    "urn:utopia:ns:sizeBytes",
+                    "urn:utopia:ns:docTimeSource",
+                    "urn:utopia:ns:tag",
+                    "urn:utopia:ns:externalKey",
+                    "https://schema.org/datePublished",
+                    "http://www.w3.org/ns/prov#generatedAtTime",
+                    "http://www.w3.org/ns/prov#invalidatedAtTime",
+                    "urn:utopia:ns:purgedAt",
+                    "urn:utopia:ns:readerNeeded",
+                    "urn:utopia:ns:timeContext",
+                    "urn:utopia:ns:timeContextAt",
+                ],
+                "chunk" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "https://schema.org/isPartOf",
+                    "https://schema.org/position",
+                    "urn:utopia:ns:heading",
+                    "urn:utopia:ns:charStart",
+                    "urn:utopia:ns:charEnd",
+                    "urn:utopia:ns:docVersion",
+                    "urn:utopia:ns:ofVersion",
+                    "urn:utopia:ns:origin",
+                    "urn:utopia:ns:originModel",
+                    "urn:utopia:ns:anchor",
+                    "http://www.w3.org/ns/prov#generatedAtTime",
+                    "urn:utopia:ns:extractedAt",
+                    "http://www.w3.org/ns/prov#invalidatedAtTime",
+                ],
+                "evidence" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "urn:utopia:ns:onStatement",
+                    "urn:utopia:ns:fromChunk",
+                    "urn:utopia:ns:quote",
+                    "urn:utopia:ns:quoteStart",
+                    "urn:utopia:ns:quoteEnd",
+                    "http://www.w3.org/ns/prov#wasDerivedFrom",
+                    "urn:utopia:ns:docVersion",
+                    "urn:utopia:ns:ofVersion",
+                    "urn:utopia:ns:proposedPredicate",
+                ],
+                "docversion" => &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "urn:utopia:ns:recordId",
+                    "http://www.w3.org/ns/prov#wasRevisionOf",
+                    "urn:utopia:ns:version",
+                    "urn:utopia:ns:sha256",
+                    "urn:utopia:ns:sizeBytes",
+                    "http://www.w3.org/ns/prov#generatedAtTime",
+                ],
+                _ => panic!("unknown node kind {kind}"),
+            }
+        }
+
+        /// 该种节点声明的全部谓词格。entity/fact 两种节点上，词汇表里每条
+        /// 关系 IRI 各占一格（live triple / qualifier）——没登记就是 oracle 的洞
+        fn matrix(kind: &str, rel_iris: &[NamedNode]) -> BTreeSet<NamedNode> {
+            let mut set: BTreeSet<NamedNode> = fixed_preds(kind).iter().map(|p| nn2(p)).collect();
+            if matches!(kind, "entity" | "fact") {
+                set.extend(rel_iris.iter().cloned());
+            }
+            set
+        }
+
+        #[derive(Default)]
+        struct Expected {
+            triples: HashSet<(NamedOrBlankNode, NamedNode, Term)>,
+            cells: usize,
+            /// 分支覆盖观测：(kind, cell_key)。cell_key 是谓词 IRI；entity/fact
+            /// 上按词汇表关系展开的动态格收敛成一个 "*rel"——条件分支的粒度是
+            /// 「这种格的发射支路」，按 IRI 逐格要覆盖只会产生噪音（eternal
+            /// 谓词结构上不可能有现行边）
+            non_empty: HashSet<(String, String)>,
+            empty: HashSet<(String, String)>,
+            /// 同一格在一节点上登记过 ≥2 个 term（钉「旗标多写一个成员」这类支路）
+            multi: HashSet<(String, String)>,
+        }
+
+        impl Expected {
+            /// 登记一个节点的全部格：谓词集必须恰好等于该种别的声明集——
+            /// 少一格或多一格都是 oracle 自己的 bug，不是「没检查到」
+            fn node(
+                &mut self,
+                kind: &str,
+                subject: impl Into<NamedOrBlankNode>,
+                cells: Vec<(NamedNode, Vec<Term>)>,
+                rel_iris: &[NamedNode],
+            ) {
+                let subject: NamedOrBlankNode = subject.into();
+                let want = matrix(kind, rel_iris);
+                let got: BTreeSet<NamedNode> = cells.iter().map(|c| c.0.clone()).collect();
+                assert_eq!(
+                    want, got,
+                    "{kind} {subject}: registered cells must cover the declared matrix"
+                );
+                for (p, terms) in cells {
+                    self.cells += 1;
+                    let key = if matches!(kind, "entity" | "fact") && rel_iris.contains(&p) {
+                        "*rel".to_string()
+                    } else {
+                        p.as_str().to_string()
+                    };
+                    if terms.is_empty() {
+                        self.empty.insert((kind.to_string(), key));
+                    } else {
+                        if terms.len() > 1 {
+                            self.multi.insert((kind.to_string(), key.clone()));
+                        }
+                        self.non_empty.insert((kind.to_string(), key));
+                    }
+                    for o in terms {
+                        assert!(
+                            self.triples.insert((subject.clone(), p.clone(), o)),
+                            "two cells produced the same expected triple ({subject} {p})"
+                        );
+                    }
+                }
+            }
+        }
+
+        fn rel_iri(r: &ExportRelation) -> NamedNode {
+            r.iri
+                .as_deref()
+                .and_then(|i| NamedNode::new(i).ok())
+                .unwrap_or_else(|| mint("relation", &r.key))
+        }
+
+        fn class_iri(c: &ExportClass) -> NamedNode {
+            c.iri
+                .as_deref()
+                .and_then(|i| NamedNode::new(i).ok())
+                .unwrap_or_else(|| mint("class", &c.key))
+        }
+
+        /// 期望集构造：每个节点的每一格都从夹具行推出，条件格一律
+        /// `exact_set if cond else {}`——不做存在性等价
+        fn expected(fx: &Fx) -> Expected {
+            let rel: HashMap<Uuid, &ExportRelation> =
+                fx.relations.iter().map(|r| (r.id, r)).collect();
+            let cls: HashMap<Uuid, &ExportClass> = fx.classes.iter().map(|c| (c.id, c)).collect();
+            let rel_iris: Vec<NamedNode> = fx.relations.iter().map(rel_iri).collect();
+            let rel_dt = |id: Uuid| rel.get(&id).and_then(|r| r.datatype.as_deref());
+            let dv_keys: HashSet<(Uuid, i32)> = fx
+                .docversions
+                .iter()
+                .map(|v| (v.document_id, v.version))
+                .collect();
+            let now = now();
+            let mut x = Expected::default();
+
+            // 现行三元组：仍被持有且现在仍成立——holds_from 必须在场且 <= now，
+            // holds_to 空或 > now；无 holds_from（eternal 投影）不算现行
+            let mut live: HashMap<(Uuid, Uuid), HashSet<Term>> = HashMap::new();
+            for f in &fx.facts {
+                let held = f.invalidated_at.is_none();
+                let holds =
+                    f.holds_from.is_some_and(|t| t <= now) && f.holds_to.is_none_or(|t| t > now);
+                let obj = match (f.object_id, &f.object_value) {
+                    (Some(o), _) => Some(mint("entity", &o.to_string()).into()),
+                    (None, Some(v)) => Some(t_value(v, f.predicate_id.and_then(|p| rel_dt(p)))),
+                    _ => None,
+                };
+                if held && holds {
+                    if let (Some(p), Some(o)) = (f.predicate_id, obj) {
+                        live.entry((f.subject_id, p)).or_default().insert(o);
+                    }
+                }
+            }
+
+            for e in &fx.entities {
+                let s = mint("entity", &e.id.to_string());
+                let mut cells = vec![
+                    (
+                        nn2("http://www.w3.org/2000/01/rdf-schema#label"),
+                        vec![t_str(e.canonical_name.clone())],
+                    ),
+                    (
+                        nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                        e.type_id
+                            .map(|t| t_iri_of(class_iri(cls[&t])))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("http://www.w3.org/ns/prov#generatedAtTime"),
+                        vec![t_dt(e.created_at)],
+                    ),
+                    (
+                        nn2("urn:utopia:ns:typeSource"),
+                        vec![t_str(e.type_source.clone())],
+                    ),
+                    (
+                        nn2("urn:utopia:ns:typeResolvedAt"),
+                        e.type_resolved_at.map(t_dt).into_iter().collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:proposedType"),
+                        e.proposed_type.as_deref().map(t_str).into_iter().collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:specificType"),
+                        e.specific_type.as_deref().map(t_str).into_iter().collect(),
+                    ),
+                    (
+                        nn2("http://www.w3.org/2000/01/rdf-schema#comment"),
+                        e.description.as_deref().map(t_str).into_iter().collect(),
+                    ),
+                ];
+                for (rid, r) in &rel {
+                    cells.push((
+                        rel_iri(r),
+                        live.get(&(e.id, *rid))
+                            .cloned()
+                            .unwrap_or_default()
+                            .into_iter()
+                            .collect(),
+                    ));
+                }
+                x.node("entity", s, cells, &rel_iris);
+            }
+
+            for f in &fx.facts {
+                let s = mint("fact", &f.id.to_string());
+                let obj: Vec<Term> = match (f.object_id, &f.object_value) {
+                    (Some(o), _) => vec![mint("entity", &o.to_string()).into()],
+                    (None, Some(v)) => {
+                        vec![t_value(v, f.predicate_id.and_then(|p| rel_dt(p)))]
+                    }
+                    _ => vec![],
+                };
+                let mut cells = vec![
+                    (nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"), {
+                        let mut ts = vec![t_iri_of(nn2(
+                            "http://www.w3.org/1999/02/22-rdf-syntax-ns#Statement",
+                        ))];
+                        if f.layer == "open" {
+                            ts.push(t_iri_of(nn2("urn:utopia:ns:OpenStatement")));
+                        }
+                        ts
+                    }),
+                    (
+                        nn2("http://www.w3.org/2000/01/rdf-schema#label"),
+                        if f.layer == "open" {
+                            f.phrase.as_deref().map(t_str).into_iter().collect()
+                        } else {
+                            vec![]
+                        },
+                    ),
+                    (
+                        nn2("urn:utopia:ns:statementLayer"),
+                        vec![t_str(f.layer.clone())],
+                    ),
+                    (
+                        nn2("urn:utopia:ns:fromStatement"),
+                        f.source_statements
+                            .iter()
+                            .map(|s| t_iri_of(mint("fact", &s.to_string())))
+                            .collect(),
+                    ),
+                    (
+                        nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#subject"),
+                        vec![t_iri_of(mint("entity", &f.subject_id.to_string()))],
+                    ),
+                    (
+                        nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate"),
+                        f.predicate_id
+                            .map(|p| t_iri_of(rel_iri(rel[&p])))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#object"),
+                        obj,
+                    ),
+                    (
+                        nn2("urn:utopia:ns:supersedes"),
+                        f.supersedes
+                            .map(|o| t_iri_of(mint("fact", &o.to_string())))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:proposedPredicate"),
+                        if f.predicate_id.is_none() {
+                            f.surface_predicate
+                                .as_deref()
+                                .map(t_str)
+                                .into_iter()
+                                .collect()
+                        } else {
+                            vec![]
+                        },
+                    ),
+                    (
+                        nn2("urn:utopia:ns:relativeValue"),
+                        if f.object_value
+                            .as_ref()
+                            .and_then(|v| v.get("relative"))
+                            .and_then(|r| r.as_bool())
+                            == Some(true)
+                        {
+                            vec![t_flag()]
+                        } else {
+                            vec![]
+                        },
+                    ),
+                    (
+                        nn2("urn:utopia:ns:unit"),
+                        f.object_value
+                            .as_ref()
+                            .and_then(|v| v.get("unit"))
+                            .and_then(|u| u.as_str())
+                            .map(t_str)
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("https://schema.org/validFrom"),
+                        f.valid_from
+                            .map(|t| t_world(t, f.valid_from_precision.as_deref()))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:validFromPrecision"),
+                        f.valid_from
+                            .and_then(|_| f.valid_from_precision.as_deref())
+                            .filter(|p| matches!(*p, "hour" | "minute" | "second"))
+                            .map(t_str)
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:validFromGrade"),
+                        f.valid_from_grade
+                            .as_deref()
+                            .map(t_str)
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("https://schema.org/validThrough"),
+                        f.valid_to
+                            .map(|t| t_world(t, f.valid_to_precision.as_deref()))
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:validThroughPrecision"),
+                        f.valid_to
+                            .and_then(|_| f.valid_to_precision.as_deref())
+                            .filter(|p| matches!(*p, "hour" | "minute" | "second"))
+                            .map(t_str)
+                            .into_iter()
+                            .collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:endedUnknown"),
+                        if f.valid_to.is_none()
+                            && f.valid_to_precision.as_deref() == Some("unknown")
+                        {
+                            vec![t_flag()]
+                        } else {
+                            vec![]
+                        },
+                    ),
+                    (
+                        nn2("urn:utopia:ns:attestedFrom"),
+                        vec![t_dt(f.attested_from)],
+                    ),
+                    (
+                        nn2("urn:utopia:ns:attestedTo"),
+                        f.attested_to.map(t_dt).into_iter().collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:endDerived"),
+                        if f.end_derived {
+                            vec![t_flag()]
+                        } else {
+                            vec![]
+                        },
+                    ),
+                    (
+                        nn2("urn:utopia:ns:ruleDerived"),
+                        if f.rule_derived {
+                            vec![t_flag()]
+                        } else {
+                            vec![]
+                        },
+                    ),
+                    (
+                        nn2("http://www.w3.org/ns/prov#generatedAtTime"),
+                        vec![t_dt(f.recorded_at)],
+                    ),
+                    (
+                        nn2("http://www.w3.org/ns/prov#invalidatedAtTime"),
+                        f.invalidated_at.map(t_dt).into_iter().collect(),
+                    ),
+                    (nn2("urn:utopia:ns:confidence"), vec![t_dec(f.confidence)]),
+                    (
+                        nn2("http://www.w3.org/ns/prov#wasDerivedFrom"),
+                        f.documents
+                            .iter()
+                            .map(|d| t_iri_of(mint("document", &d.to_string())))
+                            .collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:quote"),
+                        f.quotes.iter().map(|q| t_str(q.clone())).collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:evidenceOrigin"),
+                        f.quote_origins.iter().map(|o| t_str(o.clone())).collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:statementQualifier"),
+                        f.statement_qualifiers
+                            .iter()
+                            .enumerate()
+                            .map(|(i, q)| {
+                                oxrdf::BlankNode::new(format!("sq-{}-{i}", q.fact_id))
+                                    .unwrap()
+                                    .into()
+                            })
+                            .collect(),
+                    ),
+                    (
+                        nn2("urn:utopia:ns:timeMention"),
+                        f.time_mentions
+                            .iter()
+                            .map(|m| t_iri_of(mint("timemention", &m.id.to_string())))
+                            .collect(),
+                    ),
+                ];
+                // 边上的属性（0037）：每条词汇表关系一格；序列化先 value 后
+                // entity_id——两列都在时字面量赢
+                for (rid, r) in &rel {
+                    let terms: Vec<Term> = f
+                        .qualifiers
+                        .iter()
+                        .filter(|q| q.qualifier_type_id == *rid)
+                        .filter_map(|q| {
+                            if let Some(v) = &q.value {
+                                Some(t_value(v, rel_dt(q.qualifier_type_id)))
+                            } else {
+                                q.entity_id.map(|e| mint("entity", &e.to_string()).into())
+                            }
+                        })
+                        .collect();
+                    cells.push((rel_iri(r), terms));
+                }
+                x.node("fact", s, cells, &rel_iris);
+                // 开放陈述的属性节点（bnode）：与序列化同一规则——fact_id + 序位
+                for (i, q) in f.statement_qualifiers.iter().enumerate() {
+                    let qn = oxrdf::BlankNode::new(format!("sq-{}-{i}", q.fact_id)).unwrap();
+                    x.node(
+                        "squalifier",
+                        NamedOrBlankNode::from(qn),
+                        vec![
+                            (
+                                nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                                vec![t_iri_of(nn2("urn:utopia:ns:StatementQualifier"))],
+                            ),
+                            (nn2("urn:utopia:ns:role"), vec![t_str(q.role.clone())]),
+                            (
+                                nn2("urn:utopia:ns:qualifierValue"),
+                                q.value
+                                    .as_ref()
+                                    .map(|v| t_str(v.to_string()))
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            (
+                                nn2("http://www.w3.org/ns/prov#value"),
+                                q.entity_id
+                                    .map(|e| t_iri_of(mint("entity", &e.to_string())))
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                        ],
+                        &rel_iris,
+                    );
+                }
+                // 陈述里的时间词节点：resolution 与出处一起走
+                for m in &f.time_mentions {
+                    x.node(
+                        "timemention",
+                        mint("timemention", &m.id.to_string()),
+                        vec![
+                            (
+                                nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                                vec![t_iri_of(nn2("urn:utopia:ns:TimeMention"))],
+                            ),
+                            (nn2("urn:utopia:ns:role"), vec![t_str(m.role.clone())]),
+                            (nn2("urn:utopia:ns:text"), vec![t_str(m.text.clone())]),
+                            (
+                                nn2("urn:utopia:ns:charStart"),
+                                vec![t_int(m.char_start as i64)],
+                            ),
+                            (
+                                nn2("urn:utopia:ns:onChunk"),
+                                vec![t_iri_of(mint("chunk", &m.chunk_id.to_string()))],
+                            ),
+                            (
+                                nn2("urn:utopia:ns:shape"),
+                                m.shape.as_deref().map(t_str).into_iter().collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:reference"),
+                                m.reference
+                                    .as_ref()
+                                    .map(|r| t_str(r.to_string()))
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:granularity"),
+                                m.granularity.as_deref().map(t_str).into_iter().collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:grade"),
+                                m.grade.as_deref().map(t_str).into_iter().collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:resolvedFrom"),
+                                m.resolved_from
+                                    .map(|t| t_world(t, m.resolved_from_precision.as_deref()))
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:resolvedFromPrecision"),
+                                m.resolved_from_precision
+                                    .as_deref()
+                                    .map(t_str)
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:resolvedTo"),
+                                m.resolved_to
+                                    .map(|t| t_world(t, m.resolved_to_precision.as_deref()))
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:resolvedToPrecision"),
+                                m.resolved_to_precision
+                                    .as_deref()
+                                    .map(t_str)
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:resolvedAt"),
+                                m.resolved_at.map(t_dt).into_iter().collect(),
+                            ),
+                            (
+                                nn2("http://www.w3.org/ns/prov#generatedAtTime"),
+                                vec![t_dt(m.recorded_at)],
+                            ),
+                        ],
+                        &rel_iris,
+                    );
+                }
+            }
+
+            for d in &fx.derived {
+                let s = mint("derived", &d.id.to_string());
+                let obj: Vec<Term> = match (d.object_id, &d.object_value) {
+                    (Some(o), _) => vec![mint("entity", &o.to_string()).into()],
+                    (None, Some(v)) => vec![t_value(v, rel_dt(d.predicate_id))],
+                    _ => vec![],
+                };
+                let gen = d
+                    .rule_id
+                    .map(|r| mint("rule", &r.to_string()))
+                    .unwrap_or_else(|| mint("arule", &d.attribute_rule_id.unwrap().to_string()));
+                x.node(
+                    "derived",
+                    s,
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            vec![t_iri_of(nn2(
+                                "http://www.w3.org/1999/02/22-rdf-syntax-ns#Statement",
+                            ))],
+                        ),
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#subject"),
+                            vec![t_iri_of(mint("entity", &d.subject_id.to_string()))],
+                        ),
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate"),
+                            vec![t_iri_of(rel_iri(rel[&d.predicate_id]))],
+                        ),
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#object"),
+                            obj,
+                        ),
+                        (nn2("urn:utopia:ns:derived"), vec![t_flag()]),
+                        (
+                            nn2("urn:utopia:ns:unit"),
+                            d.object_value
+                                .as_ref()
+                                .and_then(|v| v.get("unit"))
+                                .and_then(|u| u.as_str())
+                                .map(t_str)
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("https://schema.org/validFrom"),
+                            d.valid_from
+                                .map(|t| t_world(t, d.valid_from_precision.as_deref()))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:validFromPrecision"),
+                            d.valid_from
+                                .and_then(|_| d.valid_from_precision.as_deref())
+                                .filter(|p| matches!(*p, "hour" | "minute" | "second"))
+                                .map(t_str)
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("https://schema.org/validThrough"),
+                            d.valid_to
+                                .map(|t| t_world(t, d.valid_to_precision.as_deref()))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:validThroughPrecision"),
+                            d.valid_to
+                                .and_then(|_| d.valid_to_precision.as_deref())
+                                .filter(|p| matches!(*p, "hour" | "minute" | "second"))
+                                .map(t_str)
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:endedUnknown"),
+                            if d.valid_to.is_none()
+                                && d.valid_to_precision.as_deref() == Some("unknown")
+                            {
+                                vec![t_flag()]
+                            } else {
+                                vec![]
+                            },
+                        ),
+                        (
+                            nn2("http://www.w3.org/ns/prov#generatedAtTime"),
+                            vec![t_dt(d.derived_at)],
+                        ),
+                        (
+                            nn2("http://www.w3.org/ns/prov#invalidatedAtTime"),
+                            d.invalidated_at.map(t_dt).into_iter().collect(),
+                        ),
+                        (nn2("urn:utopia:ns:confidence"), vec![t_dec(d.confidence)]),
+                        (
+                            nn2("http://www.w3.org/ns/prov#wasGeneratedBy"),
+                            vec![t_iri_of(gen)],
+                        ),
+                        (
+                            nn2("http://www.w3.org/ns/prov#used"),
+                            d.premises
+                                .iter()
+                                .map(|p| t_iri_of(premise_target(p)))
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:premise"),
+                            d.premises
+                                .iter()
+                                .map(|p| t_iri_of(mint("premise", &format!("{}:{}", d.id, p.seq))))
+                                .collect(),
+                        ),
+                    ],
+                    &rel_iris,
+                );
+                for p in &d.premises {
+                    x.node(
+                        "premise",
+                        mint("premise", &format!("{}:{}", d.id, p.seq)),
+                        vec![
+                            (
+                                nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                                vec![t_iri_of(nn2("urn:utopia:ns:Premise"))],
+                            ),
+                            (nn2("urn:utopia:ns:seq"), vec![t_int(p.seq as i64)]),
+                            (
+                                nn2("http://www.w3.org/ns/prov#used"),
+                                vec![t_iri_of(premise_target(p))],
+                            ),
+                        ],
+                        &rel_iris,
+                    );
+                }
+            }
+
+            for c in &fx.classes {
+                x.node(
+                    "class",
+                    class_iri(c),
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            vec![t_iri_of(nn2("http://www.w3.org/2002/07/owl#Class"))],
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#label"),
+                            vec![t_str(c.label.clone())],
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#comment"),
+                            if c.description.is_empty() {
+                                vec![]
+                            } else {
+                                vec![t_str(c.description.clone())]
+                            },
+                        ),
+                        (
+                            nn2("urn:utopia:ns:builtin"),
+                            if c.builtin { vec![t_flag()] } else { vec![] },
+                        ),
+                        (nn2("urn:utopia:ns:updatedAt"), vec![t_dt(c.updated_at)]),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#subClassOf"),
+                            c.parents
+                                .iter()
+                                .map(|p| t_iri_of(class_iri(cls[p])))
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:primaryType"),
+                            c.primary_parents
+                                .iter()
+                                .map(|p| t_iri_of(class_iri(cls[p])))
+                                .collect(),
+                        ),
+                        (
+                            nn2("http://www.w3.org/2002/07/owl#disjointWith"),
+                            c.disjoint
+                                .iter()
+                                .map(|p| t_iri_of(class_iri(cls[p])))
+                                .collect(),
+                        ),
+                    ],
+                    &rel_iris,
+                );
+            }
+
+            for r in &fx.relations {
+                let mut types = vec![t_iri_of(nn2(if r.kind == "attribute" {
+                    "http://www.w3.org/2002/07/owl#DatatypeProperty"
+                } else {
+                    "http://www.w3.org/2002/07/owl#ObjectProperty"
+                }))];
+                for (on, t) in [
+                    (r.functional, "FunctionalProperty"),
+                    (r.inverse_functional, "InverseFunctionalProperty"),
+                    (r.is_transitive, "TransitiveProperty"),
+                    (r.is_symmetric, "SymmetricProperty"),
+                    (r.is_asymmetric, "AsymmetricProperty"),
+                    (r.is_irreflexive, "IrreflexiveProperty"),
+                ] {
+                    if on {
+                        types.push(t_iri_of(nn2(&format!("http://www.w3.org/2002/07/owl#{t}"))));
+                    }
+                }
+                x.node(
+                    "relation",
+                    rel_iri(r),
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            types,
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#label"),
+                            vec![t_str(r.label.clone())],
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#comment"),
+                            if r.description.is_empty() {
+                                vec![]
+                            } else {
+                                vec![t_str(r.description.clone())]
+                            },
+                        ),
+                        (
+                            nn2("urn:utopia:ns:temporal"),
+                            if r.temporal == "state" {
+                                vec![]
+                            } else {
+                                vec![t_str(r.temporal.clone())]
+                            },
+                        ),
+                        (
+                            nn2("urn:utopia:ns:builtin"),
+                            if r.builtin { vec![t_flag()] } else { vec![] },
+                        ),
+                        (nn2("urn:utopia:ns:updatedAt"), vec![t_dt(r.updated_at)]),
+                        (
+                            nn2("http://www.w3.org/2002/07/owl#inverseOf"),
+                            r.inverse_of
+                                .map(|i| t_iri_of(rel_iri(rel[&i])))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#subPropertyOf"),
+                            r.sub_property_of
+                                .map(|i| t_iri_of(rel_iri(rel[&i])))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:allowedQualifier"),
+                            r.qualifiers
+                                .iter()
+                                .map(|q| t_iri_of(rel_iri(rel[q])))
+                                .collect(),
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#domain"),
+                            r.domains
+                                .iter()
+                                .map(|d| t_iri_of(class_iri(cls[d])))
+                                .collect(),
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#range"),
+                            r.ranges
+                                .iter()
+                                .map(|d| t_iri_of(class_iri(cls[d])))
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:datatype"),
+                            r.datatype.as_deref().map(t_str).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:unit"),
+                            r.unit.as_deref().map(t_str).into_iter().collect(),
+                        ),
+                    ],
+                    &rel_iris,
+                );
+            }
+
+            for r in &fx.rules {
+                x.node(
+                    "rule",
+                    mint("rule", &r.id.to_string()),
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            vec![t_iri_of(nn2("http://www.w3.org/ns/prov#Activity"))],
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#label"),
+                            vec![t_str(r.kind.clone())],
+                        ),
+                        (nn2("urn:utopia:ns:ruleKind"), vec![t_str(r.kind.clone())]),
+                        (
+                            nn2("urn:utopia:ns:onPredicate"),
+                            vec![t_iri_of(rel_iri(rel[&r.predicate_id]))],
+                        ),
+                    ],
+                    &rel_iris,
+                );
+            }
+
+            for r in &fx.arules {
+                let s = mint("arule", &r.id.to_string());
+                x.node(
+                    "arule",
+                    s.clone(),
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            vec![t_iri_of(nn2("http://www.w3.org/ns/prov#Activity"))],
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#label"),
+                            vec![t_str(r.name.clone())],
+                        ),
+                        (nn2("urn:utopia:ns:ruleKind"), vec![t_str("business")]),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#comment"),
+                            if r.description.is_empty() {
+                                vec![]
+                            } else {
+                                vec![t_str(r.description.clone())]
+                            },
+                        ),
+                        (
+                            nn2("urn:utopia:ns:conclusion"),
+                            vec![t_str(r.conclusion.clone())],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:subjectType"),
+                            vec![t_iri_of(class_iri(cls[&r.subject_type_id]))],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:concludesType"),
+                            r.conclude_type_id
+                                .map(|t| t_iri_of(class_iri(cls[&t])))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:concludesPredicate"),
+                            r.conclude_predicate_id
+                                .map(|p| t_iri_of(rel_iri(rel[&p])))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:concludesValue"),
+                            r.conclude_predicate_id
+                                .and_then(|p| {
+                                    r.conclude_value.as_ref().map(|v| t_value(v, rel_dt(p)))
+                                })
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:concludeExpr"),
+                            r.conclude_expr
+                                .as_ref()
+                                .map(|e| t_str(e.to_string()))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:readsPredicate"),
+                            r.conclude_expr
+                                .as_ref()
+                                .map(|e| {
+                                    expr_attrs(e)
+                                        .iter()
+                                        .map(|u| t_iri_of(rel_iri(rel[u])))
+                                        .collect()
+                                })
+                                .unwrap_or_default(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:condition"),
+                            r.conditions
+                                .iter()
+                                .map(|c| {
+                                    t_iri_of(mint(
+                                        "condition",
+                                        &format!("{}:{}:{}", c.rule_id, c.group_seq, c.seq),
+                                    ))
+                                })
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:disabled"),
+                            if r.enabled { vec![] } else { vec![t_flag()] },
+                        ),
+                    ],
+                    &rel_iris,
+                );
+                for c in &r.conditions {
+                    x.node(
+                        "condition",
+                        mint(
+                            "condition",
+                            &format!("{}:{}:{}", c.rule_id, c.group_seq, c.seq),
+                        ),
+                        vec![
+                            (
+                                nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                                vec![t_iri_of(nn2("urn:utopia:ns:RuleCondition"))],
+                            ),
+                            (nn2("urn:utopia:ns:recordId"), vec![t_str(c.id.to_string())]),
+                            (
+                                nn2("urn:utopia:ns:groupSeq"),
+                                vec![t_int(c.group_seq as i64)],
+                            ),
+                            (nn2("urn:utopia:ns:seq"), vec![t_int(c.seq as i64)]),
+                            (
+                                nn2("urn:utopia:ns:onPredicate"),
+                                vec![t_iri_of(rel_iri(rel[&c.predicate_id]))],
+                            ),
+                            (nn2("urn:utopia:ns:op"), vec![t_str(c.op.clone())]),
+                            (
+                                nn2("urn:utopia:ns:operand"),
+                                c.operand
+                                    .as_ref()
+                                    .map(|o| t_str(o.to_string()))
+                                    .into_iter()
+                                    .collect(),
+                            ),
+                            (
+                                nn2("urn:utopia:ns:readsPredicate"),
+                                c.operand
+                                    .as_ref()
+                                    .filter(|o| o.is_object())
+                                    .map(|o| {
+                                        expr_attrs(o)
+                                            .iter()
+                                            .map(|u| t_iri_of(rel_iri(rel[u])))
+                                            .collect()
+                                    })
+                                    .unwrap_or_default(),
+                            ),
+                        ],
+                        &rel_iris,
+                    );
+                }
+            }
+
+            for d in &fx.documents {
+                x.node(
+                    "document",
+                    mint("document", &d.id.to_string()),
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            vec![t_iri_of(nn2("http://www.w3.org/ns/prov#Entity"))],
+                        ),
+                        (
+                            nn2("http://www.w3.org/2000/01/rdf-schema#label"),
+                            vec![t_str(d.filename.clone())],
+                        ),
+                        (nn2("urn:utopia:ns:sha256"), vec![t_str(d.sha256.clone())]),
+                        (
+                            nn2("https://schema.org/encodingFormat"),
+                            vec![t_str(d.mime.clone())],
+                        ),
+                        (nn2("urn:utopia:ns:sizeBytes"), vec![t_int(d.size_bytes)]),
+                        (
+                            nn2("urn:utopia:ns:docTimeSource"),
+                            vec![t_str(d.doc_time_source.clone())],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:tag"),
+                            d.tags.iter().map(|t| t_str(t.clone())).collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:externalKey"),
+                            d.external_key.as_deref().map(t_str).into_iter().collect(),
+                        ),
+                        (
+                            nn2("https://schema.org/datePublished"),
+                            d.doc_time
+                                .map(|t| t_world(t, Some("day")))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("http://www.w3.org/ns/prov#generatedAtTime"),
+                            vec![t_dt(d.created_at)],
+                        ),
+                        (
+                            nn2("http://www.w3.org/ns/prov#invalidatedAtTime"),
+                            d.deleted_at.map(t_dt).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:purgedAt"),
+                            d.purged_at.map(t_dt).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:readerNeeded"),
+                            d.reader_needed.as_deref().map(t_str).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:timeContext"),
+                            d.time_context
+                                .as_ref()
+                                .map(|t| t_str(t.to_string()))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:timeContextAt"),
+                            d.time_context_at.map(t_dt).into_iter().collect(),
+                        ),
+                    ],
+                    &rel_iris,
+                );
+            }
+
+            for c in &fx.chunks {
+                x.node(
+                    "chunk",
+                    mint("chunk", &c.id.to_string()),
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            vec![t_iri_of(nn2("urn:utopia:ns:Chunk"))],
+                        ),
+                        (
+                            nn2("https://schema.org/isPartOf"),
+                            vec![t_iri_of(mint("document", &c.document_id.to_string()))],
+                        ),
+                        (
+                            nn2("https://schema.org/position"),
+                            vec![t_int(c.seq as i64)],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:heading"),
+                            c.heading.as_deref().map(t_str).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:charStart"),
+                            vec![t_int(c.char_start as i64)],
+                        ),
+                        (nn2("urn:utopia:ns:charEnd"), vec![t_int(c.char_end as i64)]),
+                        (
+                            nn2("urn:utopia:ns:docVersion"),
+                            vec![t_int(c.doc_version as i64)],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:ofVersion"),
+                            if dv_keys.contains(&(c.document_id, c.doc_version)) {
+                                vec![t_iri_of(mint(
+                                    "docversion",
+                                    &format!("{}:{}", c.document_id, c.doc_version),
+                                ))]
+                            } else {
+                                vec![]
+                            },
+                        ),
+                        (nn2("urn:utopia:ns:origin"), vec![t_str(c.origin.clone())]),
+                        (
+                            nn2("urn:utopia:ns:originModel"),
+                            c.origin_model.as_deref().map(t_str).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:anchor"),
+                            c.anchor
+                                .as_ref()
+                                .map(|a| t_str(a.to_string()))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("http://www.w3.org/ns/prov#generatedAtTime"),
+                            vec![t_dt(c.created_at)],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:extractedAt"),
+                            c.extracted_at.map(t_dt).into_iter().collect(),
+                        ),
+                        (
+                            nn2("http://www.w3.org/ns/prov#invalidatedAtTime"),
+                            c.superseded_at.map(t_dt).into_iter().collect(),
+                        ),
+                    ],
+                    &rel_iris,
+                );
+            }
+
+            for e in &fx.evidence {
+                x.node(
+                    "evidence",
+                    mint("evidence", &format!("{}:{}", e.fact_id, e.chunk_id)),
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            vec![t_iri_of(nn2("urn:utopia:ns:Evidence"))],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:onStatement"),
+                            vec![t_iri_of(mint("fact", &e.fact_id.to_string()))],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:fromChunk"),
+                            vec![t_iri_of(mint("chunk", &e.chunk_id.to_string()))],
+                        ),
+                        (
+                            nn2("urn:utopia:ns:quote"),
+                            e.quote.as_deref().map(t_str).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:quoteStart"),
+                            e.quote_start.map(|s| t_int(s as i64)).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:quoteEnd"),
+                            e.quote_end.map(|s| t_int(s as i64)).into_iter().collect(),
+                        ),
+                        (
+                            nn2("http://www.w3.org/ns/prov#wasDerivedFrom"),
+                            e.document_id
+                                .map(|d| t_iri_of(mint("document", &d.to_string())))
+                                .into_iter()
+                                .collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:docVersion"),
+                            e.doc_version.map(|v| t_int(v as i64)).into_iter().collect(),
+                        ),
+                        (
+                            nn2("urn:utopia:ns:ofVersion"),
+                            match (e.document_id, e.doc_version) {
+                                (Some(d), Some(v)) if dv_keys.contains(&(d, v)) => {
+                                    vec![t_iri_of(mint("docversion", &format!("{d}:{v}")))]
+                                }
+                                _ => vec![],
+                            },
+                        ),
+                        (
+                            nn2("urn:utopia:ns:proposedPredicate"),
+                            e.proposed_predicate
+                                .as_deref()
+                                .map(t_str)
+                                .into_iter()
+                                .collect(),
+                        ),
+                    ],
+                    &rel_iris,
+                );
+            }
+
+            for v in &fx.docversions {
+                x.node(
+                    "docversion",
+                    mint("docversion", &format!("{}:{}", v.document_id, v.version)),
+                    vec![
+                        (
+                            nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+                            vec![t_iri_of(nn2("urn:utopia:ns:DocumentVersion"))],
+                        ),
+                        (nn2("urn:utopia:ns:recordId"), vec![t_str(v.id.to_string())]),
+                        (
+                            nn2("http://www.w3.org/ns/prov#wasRevisionOf"),
+                            vec![t_iri_of(mint("document", &v.document_id.to_string()))],
+                        ),
+                        (nn2("urn:utopia:ns:version"), vec![t_int(v.version as i64)]),
+                        (nn2("urn:utopia:ns:sha256"), vec![t_str(v.sha256.clone())]),
+                        (nn2("urn:utopia:ns:sizeBytes"), vec![t_int(v.size_bytes)]),
+                        (
+                            nn2("http://www.w3.org/ns/prov#generatedAtTime"),
+                            vec![t_dt(v.ingested_at)],
+                        ),
+                    ],
+                    &rel_iris,
+                );
+            }
+            x
+        }
+
+        fn t_iri_of(n: NamedNode) -> Term {
+            n.into()
+        }
+
+        fn premise_target(p: &ExportPremise) -> NamedNode {
+            match (p.fact_id, p.derived_id) {
+                (Some(f), _) => mint("fact", &f.to_string()),
+                (None, Some(d)) => mint("derived", &d.to_string()),
+                _ => unreachable!(),
+            }
+        }
+
+        /// 每个矩阵格都能打到的夹具：每类节点至少一行，条件格两侧都有
+        struct Fx {
+            classes: Vec<ExportClass>,
+            relations: Vec<ExportRelation>,
+            rules: Vec<ExportRule>,
+            arules: Vec<ExportAttributeRule>,
+            entities: Vec<ExportEntity>,
+            documents: Vec<ExportDocument>,
+            docversions: Vec<ExportDocumentVersion>,
+            chunks: Vec<ExportChunk>,
+            facts: Vec<ExportFact>,
+            evidence: Vec<ExportEvidence>,
+            derived: Vec<ExportDerived>,
+        }
+
+        fn entity(n: u8, name: &str, type_id: Option<Uuid>) -> ExportEntity {
+            ExportEntity {
+                id: id(n),
+                canonical_name: name.into(),
+                type_id,
+                type_kb: type_id.map(|_| kb()),
+                type_source: "extracted".into(),
+                type_resolved_at: None,
+                proposed_type: None,
+                specific_type: None,
+                description: None,
+                created_at: at("2026-01-01T00:00:00Z"),
+            }
+        }
+
+        impl Fx {
+            fn full() -> Self {
+                let mut well = class(30, "well", None);
+                well.builtin = true;
+                well.description = "gas well".into();
+                well.parents = vec![id(1)];
+                well.primary_parents = vec![id(1)];
+                well.disjoint = vec![id(3)];
+
+                let mut spouse = relation(20, "spouse", None, "relation");
+                spouse.description = "married to".into();
+                spouse.inverse_of = Some(id(21));
+                spouse.sub_property_of = Some(id(22));
+                spouse.qualifiers = vec![id(4)];
+                spouse.domains = vec![id(1)];
+                spouse.ranges = vec![id(3)];
+                spouse.builtin = true;
+                spouse.is_transitive = true;
+                spouse.temporal = "event".into();
+                let mut eternal = relation(23, "eternal_bond", None, "relation");
+                eternal.temporal = "eternal".into();
+                eternal.functional = false;
+                // 关系节点的声明单位（relation unit 真分支）
+                let mut headcount = relation(4, "headcount", None, "attribute");
+                headcount.unit = Some("%".into());
+
+                // 规则与业务规则：公理一条、业务两条（一条带算式与条件、
+                // 一条 typing 且停用）
+                let rule = ExportRule {
+                    id: id(8),
+                    kind: "transitive".into(),
+                    predicate_id: id(2),
+                    predicate_kb: Some(kb()),
+                };
+                let arule = ExportAttributeRule {
+                    id: id(9),
+                    name: "Margin rule".into(),
+                    description: "computes".into(),
+                    conclusion: "computed".into(),
+                    subject_type_id: id(1),
+                    conclude_type_id: None,
+                    conclude_predicate_id: Some(id(4)),
+                    conclude_value: Some(serde_json::json!({"value": 0.42})),
+                    conclude_expr: Some(serde_json::json!({
+                        "op": "mul", "l": {"attr": id(4).to_string()}, "r": {"const": 2}
+                    })),
+                    enabled: true,
+                    conditions: vec![
+                        ExportRuleCondition {
+                            id: id(15),
+                            rule_id: id(9),
+                            group_seq: 0,
+                            seq: 1,
+                            predicate_id: id(4),
+                            op: "gt".into(),
+                            operand: Some(serde_json::json!({"attr": id(4).to_string()})),
+                            predicate_kb: Some(kb()),
+                        },
+                        ExportRuleCondition {
+                            id: id(16),
+                            rule_id: id(9),
+                            group_seq: 1,
+                            seq: 1,
+                            predicate_id: id(4),
+                            op: "present".into(),
+                            operand: None,
+                            predicate_kb: Some(kb()),
+                        },
+                    ],
+                    subject_type_kb: Some(kb()),
+                    conclude_type_kb: None,
+                    conclude_predicate_kb: Some(kb()),
+                };
+                let arule_off = ExportAttributeRule {
+                    id: id(14),
+                    name: "Off".into(),
+                    description: String::new(),
+                    conclusion: "typing".into(),
+                    subject_type_id: id(1),
+                    conclude_type_id: Some(id(3)),
+                    conclude_predicate_id: None,
+                    conclude_value: None,
+                    conclude_expr: None,
+                    enabled: false,
+                    conditions: vec![],
+                    subject_type_kb: Some(kb()),
+                    conclude_type_kb: Some(kb()),
+                    conclude_predicate_kb: None,
+                };
+
+                // 实体：全字段的一条 + 光秃秃的一条
+                let mut acme = entity(10, "Acme", Some(id(30)));
+                acme.type_source = "human".into();
+                acme.type_resolved_at = Some(at("2026-01-02T00:00:00Z"));
+                acme.proposed_type = Some("energy major".into());
+                acme.specific_type = Some("gas producer".into());
+                acme.description = Some("an energy major".into());
+                let bob = entity(11, "Bob", None);
+                let carol = entity(42, "Carol", None);
+
+                // 文档：全字段、删除、清空各一份
+                let doc = ExportDocument {
+                    id: id(12),
+                    filename: "annual.md".into(),
+                    external_key: Some("src://acme/annual".into()),
+                    sha256: "a".repeat(64),
+                    mime: "text/markdown".into(),
+                    size_bytes: 42,
+                    doc_time_source: "document".into(),
+                    tags: vec!["filing".into(), "annual".into()],
+                    doc_time: Some(at("2024-03-01T08:00:00Z")),
+                    created_at: at("2026-01-01T00:00:00Z"),
+                    deleted_at: None,
+                    purged_at: None,
+                    reader_needed: Some("pdf".into()),
+                    time_context: Some(
+                        serde_json::json!({"period": "FY2023", "calendar": "fiscal"}),
+                    ),
+                    time_context_at: Some(at("2026-01-05T00:00:00Z")),
+                };
+                let doc_gone = ExportDocument {
+                    id: id(17),
+                    filename: "gone.md".into(),
+                    external_key: None,
+                    sha256: "b".repeat(64),
+                    mime: "text/markdown".into(),
+                    size_bytes: 1,
+                    doc_time_source: "upload".into(),
+                    tags: vec![],
+                    doc_time: None,
+                    created_at: at("2026-01-01T00:00:00Z"),
+                    deleted_at: Some(at("2026-04-01T00:00:00Z")),
+                    purged_at: Some(at("2026-04-02T00:00:00Z")),
+                    reader_needed: None,
+                    time_context: None,
+                    time_context_at: None,
+                };
+
+                let version = ExportDocumentVersion {
+                    id: id(18),
+                    document_id: id(12),
+                    version: 2,
+                    sha256: "deadbeef".into(),
+                    size_bytes: 4096,
+                    ingested_at: at("2026-03-01T00:00:00.123456Z"),
+                    document_kb: Some(kb()),
+                };
+
+                let mut c1 = chunk(13);
+                c1.document_id = id(12);
+                c1.doc_version = 2;
+                c1.version_row = true;
+                c1.extracted_at = Some(at("2026-03-02T00:00:00Z"));
+                c1.origin = "pasted".into();
+                c1.origin_model = Some("clip-v2".into());
+                c1.anchor = Some(serde_json::json!({"page": 7}));
+                let mut c2 = chunk(19);
+                c2.document_id = id(12);
+                c2.doc_version = 3;
+                c2.heading = None;
+                c2.superseded_at = Some(at("2026-04-01T00:00:00Z"));
+
+                // 事实：每个分支一条
+                let mut live = fact(5);
+                live.documents = vec![id(12)];
+                live.quotes = vec!["joined in 2023".into()];
+                live.quote_origins = vec!["pasted".into()];
+                live.qualifiers = vec![
+                    FactQualifier {
+                        qualifier_type_id: id(4),
+                        key: "headcount".into(),
+                        label: "headcount".into(),
+                        value: Some(serde_json::json!({"value": 42})),
+                        entity_id: None,
+                        entity_name: None,
+                    },
+                    FactQualifier {
+                        qualifier_type_id: id(2),
+                        key: "works_for".into(),
+                        label: "works_for".into(),
+                        value: None,
+                        entity_id: Some(id(11)),
+                        entity_name: Some("Bob".into()),
+                    },
+                    // SYNTHETIC-ONLY：真表上 fact_qualifiers 的 XOR CHECK
+                    // （(value IS NOT NULL) <> (entity_id IS NOT NULL)）挡住两列
+                    // 同在的行；这里直接构造 Export* 行打序列化器
+                    // 「value 在场则 entity_id 让路」的优先支路
+                    FactQualifier {
+                        qualifier_type_id: id(20),
+                        key: "spouse".into(),
+                        label: "spouse".into(),
+                        value: Some(serde_json::json!({"value": "via introduction"})),
+                        entity_id: Some(id(11)),
+                        entity_name: Some("Bob".into()),
+                    },
+                ];
+                live.supersedes = Some(id(6));
+                live.supersedes_kb = Some(kb());
+                live.attested_to = Some(at("2026-03-15T00:00:00Z"));
+                live.end_derived = true;
+                live.rule_derived = true;
+                live.valid_from = Some(at("2023-05-04T10:00:00Z"));
+                live.valid_from_precision = Some("hour".into());
+
+                let mut old = fact(6);
+                old.invalidated_at = Some(at("2026-03-01T00:00:00Z"));
+
+                let mut attr = fact(7);
+                attr.predicate_id = Some(id(4));
+                attr.object_id = None;
+                attr.object_value = Some(serde_json::json!({"value": 65, "unit": "%"}));
+
+                let mut bare = fact(24);
+                bare.predicate_id = None;
+                bare.predicate_kb = None;
+                bare.surface_predicate = Some("acquired".into());
+
+                // 谓词没绑定的陈述仍带字面值宾语：缺位的只是 datatype，
+                // 宾语本身必须到（#821）——datatype 空意味着简单字面量
+                let mut bare_val = fact(43);
+                bare_val.predicate_id = None;
+                bare_val.predicate_kb = None;
+                bare_val.object_id = None;
+                bare_val.object_kb = None;
+                bare_val.object_value = Some(serde_json::json!({"value": "待复检"}));
+                bare_val.surface_predicate = Some("状态".into());
+
+                let mut empty_obj = fact(25);
+                empty_obj.object_id = None;
+                empty_obj.object_value = None;
+
+                let mut future = fact(26);
+                future.holds_from = Some(at("2099-01-01T00:00:00Z"));
+
+                let mut closed = fact(27);
+                closed.valid_to = Some(at("2024-07-01T00:00:00Z"));
+                closed.valid_to_precision = Some("month".into());
+                closed.holds_to = Some(at("2024-08-01T00:00:00Z"));
+
+                let mut eternal_f = fact(28);
+                eternal_f.predicate_id = Some(id(23));
+                eternal_f.holds_from = None;
+
+                let mut undated_end = fact(29);
+                undated_end.valid_to_precision = Some("unknown".into());
+                undated_end.attested_to = Some(at("2025-03-01T00:00:00Z"));
+                undated_end.holds_to = Some(at("2025-03-01T00:00:00Z"));
+
+                let mut year_f = fact(31);
+                year_f.subject_id = id(11); // 另一主语：别与 fact(5) 撞出重复的现行边
+                year_f.valid_from = Some(at("2023-01-01T00:00:00Z"));
+                year_f.valid_from_precision = Some("year".into());
+
+                // relative:true 的字面值（#681）：relativeValue+unit 的真分支，
+                // 且 datatype 被压成 xsd:string（headcount 声明 number，relative
+                // 值不是日期/数字）。主语换 bob：避免给 acme 的 headcount 格
+                // 再叠一条现行边（不是不行，是让 cell 内容读起来干净）
+                let mut rel_f = fact(35);
+                rel_f.subject_id = id(11);
+                rel_f.predicate_id = Some(id(4));
+                rel_f.object_id = None;
+                rel_f.object_value = Some(serde_json::json!({
+                    "value": "45 days after signing", "relative": true, "unit": "days"
+                }));
+
+                // valid_to + 秒级精度：fact 侧 validThroughPrecision 的真分支
+                // （year/month/day 都不发 precision 字面值，已各有覆盖）
+                let mut closed_sec = fact(36);
+                closed_sec.valid_to = Some(at("2024-07-01T12:34:56Z"));
+                closed_sec.valid_to_precision = Some("second".into());
+                closed_sec.holds_to = Some(at("2024-07-01T12:34:57Z"));
+
+                // 开放陈述（0061）：layer/phrase、自己的属性节点（值与实体各一）、
+                // 时间提及节点（全字段与光杆各一）、valid_from 的来历等级
+                let mut open = fact(38);
+                open.layer = "open".into();
+                open.predicate_id = None;
+                open.predicate_kb = None;
+                open.phrase = Some("joined".into());
+                open.surface_predicate = Some("employs".into());
+                open.valid_from_grade = Some("B".into());
+                open.statement_qualifiers = vec![
+                    ExportStatementQualifier {
+                        fact_id: id(38),
+                        role: "since".into(),
+                        value: Some(serde_json::json!("2023-04")),
+                        entity_id: None,
+                        entity_kb: None,
+                        entity_merged: false,
+                    },
+                    ExportStatementQualifier {
+                        fact_id: id(38),
+                        role: "witness".into(),
+                        value: None,
+                        entity_id: Some(id(11)),
+                        entity_kb: Some(kb()),
+                        entity_merged: false,
+                    },
+                ];
+                open.time_mentions = vec![
+                    ExportTimeMention {
+                        id: id(40),
+                        kb_id: kb(),
+                        fact_id: id(38),
+                        chunk_id: id(13),
+                        chunk_kb: Some(kb()),
+                        role: "when".into(),
+                        text: "去年四月".into(),
+                        char_start: 12,
+                        shape: Some("point".into()),
+                        reference: Some(serde_json::json!({"kind": "month"})),
+                        granularity: Some("month".into()),
+                        resolved_from: Some(at("2023-04-01T00:00:00Z")),
+                        resolved_from_precision: Some("month".into()),
+                        resolved_to: Some(at("2023-05-01T00:00:00Z")),
+                        resolved_to_precision: Some("month".into()),
+                        resolved_at: Some(at("2026-03-01T00:00:00Z")),
+                        grade: Some("B".into()),
+                        recorded_at: at("2026-02-15T00:00:00Z"),
+                    },
+                    ExportTimeMention {
+                        id: id(41),
+                        kb_id: kb(),
+                        fact_id: id(38),
+                        chunk_id: id(13),
+                        chunk_kb: Some(kb()),
+                        role: "until".into(),
+                        text: "前年".into(),
+                        char_start: 0,
+                        shape: None,
+                        reference: None,
+                        granularity: None,
+                        resolved_from: None,
+                        resolved_from_precision: None,
+                        resolved_to: None,
+                        resolved_to_precision: None,
+                        resolved_at: None,
+                        grade: None,
+                        recorded_at: at("2026-02-15T00:00:00Z"),
+                    },
+                ];
+
+                // 类型化事实的来源边（0067/0068）：fromStatement 指回那条开放陈述。
+                // 宾语用 carol：bob works_for bob 的现行边已被 year_f 占住
+                let mut typed = fact(39);
+                typed.subject_id = id(11);
+                typed.object_id = Some(id(42));
+                typed.predicate_id = Some(id(2));
+                typed.source_statements = vec![id(38)];
+                typed.valid_from_grade = Some("A".into());
+
+                let evidence = vec![
+                    ExportEvidence {
+                        fact_id: id(5),
+                        chunk_id: id(13),
+                        document_id: Some(id(12)),
+                        doc_version: Some(2),
+                        version_row: true,
+                        quote: Some("joined in 2023".into()),
+                        quote_start: Some(41),
+                        quote_end: Some(54),
+                        proposed_predicate: Some("employs".into()),
+                        chunk_kb: Some(kb()),
+                        document_kb: Some(kb()),
+                    },
+                    ExportEvidence {
+                        fact_id: id(6),
+                        chunk_id: id(19),
+                        document_id: None,
+                        doc_version: None,
+                        version_row: false,
+                        quote: None,
+                        quote_start: None,
+                        quote_end: None,
+                        proposed_predicate: None,
+                        chunk_kb: Some(kb()),
+                        document_kb: None,
+                    },
+                ];
+
+                // 派生：公理规则推的（前提混断言与派生、小时精度），
+                // 业务规则推的（字面值结论、分钟精度终点），被作废的
+                let mut d1 = derived(32);
+                d1.rule_id = Some(id(8));
+                d1.rule_kb = Some(kb());
+                d1.valid_from = Some(at("2024-06-01T10:00:00Z"));
+                d1.valid_from_precision = Some("hour".into());
+                d1.premises = vec![
+                    ExportPremise {
+                        seq: 0,
+                        fact_id: Some(id(5)),
+                        derived_id: None,
+                    },
+                    ExportPremise {
+                        seq: 1,
+                        fact_id: None,
+                        derived_id: Some(id(33)),
+                    },
+                ];
+                let mut d2 = derived(33);
+                d2.rule_id = None;
+                d2.rule_kb = None;
+                d2.attribute_rule_id = Some(id(9));
+                d2.attribute_rule_kb = Some(kb());
+                d2.object_id = None;
+                d2.object_kb = None;
+                d2.object_value = Some(serde_json::json!({"value": 0.95, "unit": "ratio"}));
+                d2.valid_to = Some(at("2025-01-15T00:00:00Z"));
+                d2.valid_to_precision = Some("minute".into());
+                d2.premises = vec![];
+                let mut d3 = derived(34);
+                d3.invalidated_at = Some(at("2026-03-02T00:00:00Z"));
+                // SYNTHETIC-ONLY：valid_to NULL + precision 'unknown' 的组合
+                // 被真表 CHECK（derived_to_precision_needs_date：precision 非空
+                // 则 valid_to 必须非空）挡死——只有合成 ExportDerived 打得到
+                // derived endedUnknown 的发射支路。object 两列皆空，
+                // 顺带覆盖 derived rdf:object 的假支
+                let mut d4 = derived(37);
+                d4.object_id = None;
+                d4.object_kb = None;
+                d4.object_value = None;
+                d4.valid_to = None;
+                d4.valid_to_precision = Some("unknown".into());
+                d4.premises = vec![];
+
+                Fx {
+                    classes: vec![
+                        class(1, "person", Some("https://schema.org/Person")),
+                        class(3, "team", None),
+                        well,
+                    ],
+                    relations: vec![
+                        relation(
+                            2,
+                            "works_for",
+                            Some("https://schema.org/worksFor"),
+                            "relation",
+                        ),
+                        headcount,
+                        relation(21, "partner", None, "relation"),
+                        relation(22, "kin", None, "relation"),
+                        spouse,
+                        eternal,
+                    ],
+                    rules: vec![rule],
+                    arules: vec![arule, arule_off],
+                    entities: vec![acme, bob, carol],
+                    documents: vec![doc, doc_gone],
+                    docversions: vec![version],
+                    chunks: vec![c1, c2],
+                    facts: vec![
+                        live,
+                        old,
+                        attr,
+                        bare,
+                        bare_val,
+                        empty_obj,
+                        future,
+                        closed,
+                        eternal_f,
+                        undated_end,
+                        year_f,
+                        rel_f,
+                        closed_sec,
+                        open,
+                        typed,
+                    ],
+                    evidence,
+                    derived: vec![d1, d2, d3, d4],
+                }
+            }
+
+            /// 被测的一侧：照常走 emit_*（与导出路由同一顺序）
+            fn emit(&self, format: Format) -> Vec<Quad> {
+                let names = Names::new(kb(), None).unwrap();
+                let vocab = vocabulary(&names, &self.classes, &self.relations);
+                let buf = SharedBuf::default();
+                let mut sink = Sink::new(format, buf.clone());
+                for c in &self.classes {
+                    emit_class(&mut sink, &vocab, c).unwrap();
+                }
+                for r in &self.relations {
+                    emit_relation(&mut sink, &vocab, r).unwrap();
+                }
+                for r in &self.rules {
+                    emit_rule(&mut sink, &names, &vocab, r).unwrap();
+                }
+                for r in &self.arules {
+                    emit_attribute_rule(&mut sink, &names, &vocab, r).unwrap();
+                }
+                for d in &self.documents {
+                    emit_document(&mut sink, &names, d).unwrap();
+                }
+                for v in &self.docversions {
+                    emit_docversion(&mut sink, &names, v).unwrap();
+                }
+                for c in &self.chunks {
+                    emit_chunk(&mut sink, &names, c).unwrap();
+                }
+                for e in &self.entities {
+                    emit_entity(&mut sink, &names, &vocab, e).unwrap();
+                }
+                for f in &self.facts {
+                    emit_fact(&mut sink, &names, &vocab, f, now()).unwrap();
+                }
+                for e in &self.evidence {
+                    emit_evidence(&mut sink, &names, e).unwrap();
+                }
+                for d in &self.derived {
+                    emit_derived(&mut sink, &names, &vocab, d).unwrap();
+                }
+                sink.finish().unwrap();
+                let bytes = buf.take();
+                oxrdfio::RdfParser::from_format(match format {
+                    Format::Turtle => oxrdfio::RdfFormat::Turtle,
+                    Format::JsonLd => oxrdfio::RdfFormat::JsonLd {
+                        profile: oxrdfio::JsonLdProfileSet::empty(),
+                    },
+                })
+                .for_slice(&bytes)
+                .map(|q| q.expect("导出的文件必须解析得回来"))
+                .collect()
+            }
+        }
+
+        /// quad 全集，四分量一体入账：把三元组搬进命名图
+        /// 的变种在三元组投影下与 E 相等，在 quad 核算下必破账。
+        /// 序列化器合约是全部写 DEFAULT graph（Sink::triple 固定
+        /// in_graph(DefaultGraph)），所以期望侧一律补 DefaultGraph
+        fn to_set(quads: &[Quad]) -> HashSet<Quad> {
+            quads.iter().cloned().collect()
+        }
+
+        fn expected_quads(expected: &Expected) -> HashSet<Quad> {
+            expected
+                .triples
+                .iter()
+                .map(|(s, p, o)| {
+                    Quad::new(s.clone(), p.clone(), o.clone(), GraphName::DefaultGraph)
+                })
+                .collect()
+        }
+
+        /// 全量核算：A（解析回的全部 quad）== E（独立期望集，全在
+        /// DEFAULT graph），emitted == distinct，每个声明格都登记过。
+        /// 两种格式同判
+        #[test]
+        fn the_whole_export_is_accounted_for() {
+            let fx = Fx::full();
+            let expected = expected(&fx);
+            let expected = expected_quads(&expected);
+            for format in [Format::Turtle, Format::JsonLd] {
+                let quads = fx.emit(format);
+                assert!(
+                    quads
+                        .iter()
+                        .all(|q| q.graph_name == GraphName::DefaultGraph),
+                    "{format:?}: every emitted quad must sit in the default graph"
+                );
+                let actual = to_set(&quads);
+                assert_eq!(
+                    quads.len(),
+                    actual.len(),
+                    "{format:?}: duplicate quads emitted"
+                );
+                let missing: Vec<_> = expected.difference(&actual).collect();
+                let unexpected: Vec<_> = actual.difference(&expected).collect();
+                assert!(
+                    missing.is_empty() && unexpected.is_empty(),
+                    "{format:?}: missing={missing:?} unexpected={unexpected:?}"
+                );
+            }
+        }
+
+        /// 核算自身的咬合度：任何没有被期望集背书的 term——换面、加成员、
+        /// 空格塞字面量、bnode、未背书边、**搬进命名图**——都必须破账。
+        /// 换面、加成员、空格塞字面量、bnode 四类变种打头
+        #[test]
+        fn the_accounting_rejects_unaccounted_terms() {
+            let fx = Fx::full();
+            let expected = expected_quads(&expected(&fx));
+            let actual = to_set(&fx.emit(Format::Turtle));
+            let fact5 = nn2("urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:fact:05050505-0505-0505-0505-050505050505");
+            let derived32 = nn2("urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:derived:20202020-2020-2020-2020-202020202020");
+            let entity11 = nn2("urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:entity:0b0b0b0b-0b0b-0b0b-0b0b-0b0b0b0b0b0b");
+            let partner =
+                nn2("urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:relation:partner");
+
+            let additions: Vec<(NamedNode, NamedNode, Term)> = vec![
+                // 字面量 rdf:subject——无期望格背书
+                (fact5.clone(), nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#subject"),
+                 Literal::new_simple_literal("not-an-iri").into()),
+                // 第二个字面量 rdf:object——无期望格背书
+                (fact5.clone(), nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#object"),
+                 Literal::new_simple_literal("second-object").into()),
+                // 限定词边——无 backing 行
+                (fact5.clone(), partner.clone(), entity11.clone().into()),
+                // 派生多一条 *Precision——该行没精度
+                (derived32.clone(), nn2("urn:utopia:ns:validThroughPrecision"),
+                 Literal::new_simple_literal("hour").into()),
+                // 空格塞 "false"（disabled/endDerived/endedUnknown/builtin 假支）
+                (nn2("urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:arule:09090909-0909-0909-0909-090909090909"),
+                 nn2("urn:utopia:ns:disabled"),
+                 Literal::new_typed_literal("false", xsd::BOOLEAN).into()),
+                // 空格塞字面量 rdf:object（empty_obj 事实）
+                (nn2("urn:utopia:kb:01a06dc4-f40a-7013-b09f-1b499e2e7441:fact:19191919-1919-1919-1919-191919191919"),
+                 nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#object"),
+                 Literal::new_simple_literal("phantom").into()),
+                // bnode 宾语——永远不会被任何期望格背书
+                (fact5.clone(), nn2("http://www.w3.org/1999/02/22-rdf-syntax-ns#subject"),
+                 Term::from(oxrdf::BlankNode::new("mutant").unwrap())),
+                // 无现行事实的现行边
+                (entity11, partner, fact5.clone().into()),
+            ];
+            for (s, p, o) in additions {
+                let mut mutated = actual.clone();
+                mutated.insert(Quad::new(s.clone(), p.clone(), o, GraphName::DefaultGraph));
+                assert_ne!(
+                    mutated, expected,
+                    "unaccounted term must break the ledger: {s} {p}"
+                );
+            }
+            // 同一三元组搬进命名图——三元组投影漏它，
+            // quad 核算下是两处破账（default 少一条、named 多一条）
+            {
+                let victim = actual.iter().next().unwrap().clone();
+                let mut moved = actual.clone();
+                moved.remove(&victim);
+                let (vs, vp, vo) = (victim.subject, victim.predicate, victim.object);
+                moved.insert(Quad::new(
+                    vs.clone(),
+                    vp.clone(),
+                    vo.clone(),
+                    nn2("urn:mutant:named-graph"),
+                ));
+                assert_ne!(moved, expected, "a named-graph move must break the ledger");
+                // 连「复制一条到命名图」（default 没少）也一样破账
+                let mut copied = actual.clone();
+                copied.insert(Quad::new(vs, vp, vo, nn2("urn:mutant:named-graph")));
+                assert_ne!(copied, expected, "a named-graph copy must break the ledger");
+            }
+            // 少一条同样破账
+            for victim in actual.iter().take(3) {
+                let mut mutated = actual.clone();
+                mutated.remove(victim);
+                assert_ne!(mutated, expected, "a dropped quad must break the ledger");
+            }
+            // 发出的 quad 数与去重数必须一致
+            assert_eq!(actual.len(), fx.emit(Format::Turtle).len());
+        }
+
+        /// 声明面里的全部条件格（kind, cell_key）。登记 ≠ 覆盖
+        /// 每个格至少要有一个夹具节点让它非空——
+        /// 真分支的发射支路真跑过且账面对上了；也要至少一个节点让它
+        /// 空着——假支一样入过账。"*rel" 是 entity/fact 上按词汇表关系
+        /// 展开的动态格族（live triple / qualifier）。
+        const CONDITIONAL_CELLS: &[(&str, &[&str])] = &[
+            (
+                "entity",
+                &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#comment",
+                    "urn:utopia:ns:typeResolvedAt",
+                    "urn:utopia:ns:proposedType",
+                    "urn:utopia:ns:specificType",
+                    "*rel",
+                ],
+            ),
+            (
+                "fact",
+                &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#label",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#predicate",
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#object",
+                    "urn:utopia:ns:fromStatement",
+                    "urn:utopia:ns:supersedes",
+                    "urn:utopia:ns:proposedPredicate",
+                    "urn:utopia:ns:relativeValue",
+                    "urn:utopia:ns:unit",
+                    "https://schema.org/validFrom",
+                    "urn:utopia:ns:validFromPrecision",
+                    "urn:utopia:ns:validFromGrade",
+                    "https://schema.org/validThrough",
+                    "urn:utopia:ns:validThroughPrecision",
+                    "urn:utopia:ns:endedUnknown",
+                    "urn:utopia:ns:attestedTo",
+                    "urn:utopia:ns:endDerived",
+                    "urn:utopia:ns:ruleDerived",
+                    "http://www.w3.org/ns/prov#invalidatedAtTime",
+                    "http://www.w3.org/ns/prov#wasDerivedFrom",
+                    "urn:utopia:ns:quote",
+                    "urn:utopia:ns:evidenceOrigin",
+                    "urn:utopia:ns:statementQualifier",
+                    "urn:utopia:ns:timeMention",
+                    "*rel",
+                ],
+            ),
+            (
+                "squalifier",
+                &[
+                    "urn:utopia:ns:qualifierValue",
+                    "http://www.w3.org/ns/prov#value",
+                ],
+            ),
+            (
+                "timemention",
+                &[
+                    "urn:utopia:ns:shape",
+                    "urn:utopia:ns:reference",
+                    "urn:utopia:ns:granularity",
+                    "urn:utopia:ns:grade",
+                    "urn:utopia:ns:resolvedFrom",
+                    "urn:utopia:ns:resolvedFromPrecision",
+                    "urn:utopia:ns:resolvedTo",
+                    "urn:utopia:ns:resolvedToPrecision",
+                    "urn:utopia:ns:resolvedAt",
+                ],
+            ),
+            (
+                "derived",
+                &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#object",
+                    "urn:utopia:ns:unit",
+                    "https://schema.org/validFrom",
+                    "urn:utopia:ns:validFromPrecision",
+                    "https://schema.org/validThrough",
+                    "urn:utopia:ns:validThroughPrecision",
+                    "urn:utopia:ns:endedUnknown",
+                    "http://www.w3.org/ns/prov#invalidatedAtTime",
+                    "http://www.w3.org/ns/prov#used",
+                    "urn:utopia:ns:premise",
+                ],
+            ),
+            (
+                "class",
+                &[
+                    "http://www.w3.org/2000/01/rdf-schema#comment",
+                    "urn:utopia:ns:builtin",
+                    "http://www.w3.org/2000/01/rdf-schema#subClassOf",
+                    "urn:utopia:ns:primaryType",
+                    "http://www.w3.org/2002/07/owl#disjointWith",
+                ],
+            ),
+            (
+                "relation",
+                &[
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                    "http://www.w3.org/2000/01/rdf-schema#comment",
+                    "urn:utopia:ns:temporal",
+                    "urn:utopia:ns:builtin",
+                    "http://www.w3.org/2002/07/owl#inverseOf",
+                    "http://www.w3.org/2000/01/rdf-schema#subPropertyOf",
+                    "urn:utopia:ns:allowedQualifier",
+                    "http://www.w3.org/2000/01/rdf-schema#domain",
+                    "http://www.w3.org/2000/01/rdf-schema#range",
+                    "urn:utopia:ns:datatype",
+                    "urn:utopia:ns:unit",
+                ],
+            ),
+            (
+                "arule",
+                &[
+                    "http://www.w3.org/2000/01/rdf-schema#comment",
+                    "urn:utopia:ns:concludesType",
+                    "urn:utopia:ns:concludesPredicate",
+                    "urn:utopia:ns:concludesValue",
+                    "urn:utopia:ns:concludeExpr",
+                    "urn:utopia:ns:readsPredicate",
+                    "urn:utopia:ns:condition",
+                    "urn:utopia:ns:disabled",
+                ],
+            ),
+            (
+                "condition",
+                &["urn:utopia:ns:operand", "urn:utopia:ns:readsPredicate"],
+            ),
+            (
+                "document",
+                &[
+                    "urn:utopia:ns:tag",
+                    "urn:utopia:ns:externalKey",
+                    "https://schema.org/datePublished",
+                    "http://www.w3.org/ns/prov#invalidatedAtTime",
+                    "urn:utopia:ns:purgedAt",
+                ],
+            ),
+            (
+                "chunk",
+                &[
+                    "urn:utopia:ns:heading",
+                    "urn:utopia:ns:ofVersion",
+                    "urn:utopia:ns:extractedAt",
+                    "http://www.w3.org/ns/prov#invalidatedAtTime",
+                ],
+            ),
+            (
+                "evidence",
+                &[
+                    "urn:utopia:ns:quote",
+                    "http://www.w3.org/ns/prov#wasDerivedFrom",
+                    "urn:utopia:ns:docVersion",
+                    "urn:utopia:ns:ofVersion",
+                    "urn:utopia:ns:proposedPredicate",
+                ],
+            ),
+        ];
+
+        /// 真表 CHECK 到不了、只能靠合成 Export* 行打到的格——声明在这里
+        /// 的意思是：覆盖证据来自夹具行，不是真实数据可达性。
+        ///   derived/endedUnknown：derived_to_precision_needs_date CHECK
+        ///     要求 precision 非空 ⇒ valid_to 非空，与该格的发射条件
+        ///     （valid_to NULL ∧ precision='unknown'）互斥。
+        ///   fact/*rel 里「value 与 entity_id 同列时字面量赢」的行级支路：
+        ///     fact_qualifiers 的 XOR CHECK 挡死两列同在——那不是格级覆盖
+        ///     问题，由下面的钉断言单独覆盖（Fx::full 里的合成 FactQualifier）。
+        const SYNTHETIC_ONLY_CELLS: &[(&str, &str)] = &[("derived", "urn:utopia:ns:endedUnknown")];
+
+        /// 结构上不可能空的格：至少一个成员无条件发射（relation 的
+        /// rdf:type 永远带 Datatype/ObjectProperty，fact 的永远带
+        /// rdf:Statement），假支不存在；
+        /// 它的条件面是「旗标多写成员」，由 multi 断言钉住
+        const EMPTY_IMPOSSIBLE: &[(&str, &str)] = &[
+            (
+                "relation",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+            ),
+            ("fact", "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        ];
+
+        /// 注册过的格不等于覆盖过的格。每个声明的条件格
+        /// 必须在夹具里至少一次非空（真支）且至少一次为空（假支），
+        /// 否则就是「登记了但没打过」——要么补夹具，要么显式声明不测。
+        #[test]
+        fn the_fixture_exercises_every_declared_conditional_cell() {
+            let fx = Fx::full();
+            let x = expected(&fx);
+
+            let mut uncovered = vec![];
+            for (kind, cells) in CONDITIONAL_CELLS {
+                for cell in *cells {
+                    let key = (kind.to_string(), cell.to_string());
+                    if !x.non_empty.contains(&key) {
+                        uncovered.push(format!("{kind}/{cell}: true branch never produced"));
+                    }
+                    let exempt_empty = EMPTY_IMPOSSIBLE.iter().any(|e| *e == (*kind, *cell));
+                    if !x.empty.contains(&key) && !exempt_empty {
+                        uncovered.push(format!("{kind}/{cell}: false branch never produced"));
+                    }
+                }
+            }
+            assert!(
+                uncovered.is_empty(),
+                "declared conditional cells not exercised by Fx::full():\n{}",
+                uncovered.join("\n")
+            );
+
+            // relation rdf:type 的假支不存在（见 EMPTY_IMPOSSIBLE），
+            // 条件面用多成员钉：spouse.is_transitive 必须真多写一个成员
+            assert!(
+                x.multi.contains(&(
+                    "relation".to_string(),
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string()
+                )),
+                "relation flag-conditional extra rdf:type member never exercised"
+            );
+            // 同一条钉 fact：layer=open 的陈述必须在 rdf:type 多写一个成员
+            assert!(
+                x.multi.contains(&(
+                    "fact".to_string(),
+                    "http://www.w3.org/1999/02/22-rdf-syntax-ns#type".to_string()
+                )),
+                "fact layer-conditional extra rdf:type member never exercised"
+            );
+
+            // SYNTHETIC-ONLY 格必须真的被夹具打到——不然「声明覆盖」
+            // 本身又是空话
+            for (kind, cell) in SYNTHETIC_ONLY_CELLS {
+                assert!(
+                    x.non_empty
+                        .contains(&((*kind).to_string(), (*cell).to_string())),
+                    "synthetic-only cell {kind}/{cell} must be exercised"
+                );
+            }
+
+            // 钉死两条 schema 到不了的支路的语义——合成行的输出 term 要精确：
+            // 1. derived endedUnknown（valid_to NULL + precision 'unknown'）
+            let d4 = mint("derived", &id(37).to_string());
+            assert!(
+                x.triples
+                    .contains(&(d4.into(), nn2("urn:utopia:ns:endedUnknown"), t_flag())),
+                "synthetic derived must emit endedUnknown"
+            );
+            // 2. qualifier value 与 entity_id 同列时字面量赢、IRI 不出现
+            let f5 = mint("fact", &id(5).to_string());
+            let spouse = mint("relation", "spouse");
+            let value_lit: Term =
+                Literal::new_typed_literal("via introduction", xsd::STRING).into();
+            let entity_term: Term = mint("entity", &id(11).to_string()).into();
+            assert!(
+                x.triples
+                    .contains(&(f5.clone().into(), spouse.clone(), value_lit)),
+                "synthetic qualifier: value must win over entity_id"
+            );
+            assert!(
+                !x.triples.contains(&(f5.into(), spouse, entity_term)),
+                "synthetic qualifier: entity_id must lose to value"
+            );
+        }
+    }
 }
