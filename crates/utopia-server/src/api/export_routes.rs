@@ -85,6 +85,13 @@ pub async fn export(
         for r in &relations {
             rdf::emit_relation(&mut sink, &vocab, r)?;
         }
+        // 公理与业务规则整份进词汇表区：引它们的派生才有 prov:wasGeneratedBy 可指
+        for r in &utopia_store::export::rules(&mut tx, kb_id).await.map_err(io)? {
+            rdf::emit_rule(&mut sink, &names, &vocab, r)?;
+        }
+        for r in &utopia_store::export::attribute_rules(&mut tx, kb_id).await.map_err(io)? {
+            rdf::emit_attribute_rule(&mut sink, &names, &vocab, r)?;
+        }
         yield axum::body::Bytes::from(buf.take());
 
         let mut after = None;
@@ -94,6 +101,30 @@ pub async fn export(
             after = Some(last.id);
             for d in &page {
                 rdf::emit_document(&mut sink, &names, d)?;
+            }
+            yield axum::body::Bytes::from(buf.take());
+        }
+
+        let mut after = None;
+        loop {
+            let page = utopia_store::export::document_versions_page(&mut tx, kb_id, after)
+                .await
+                .map_err(io)?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            for v in &page {
+                rdf::emit_docversion(&mut sink, &names, v)?;
+            }
+            yield axum::body::Bytes::from(buf.take());
+        }
+
+        let mut after = None;
+        loop {
+            let page = utopia_store::export::chunks_page(&mut tx, kb_id, after).await.map_err(io)?;
+            let Some(last) = page.last() else { break };
+            after = Some(last.id);
+            for c in &page {
+                rdf::emit_chunk(&mut sink, &names, c)?;
             }
             yield axum::body::Bytes::from(buf.take());
         }
@@ -119,6 +150,18 @@ pub async fn export(
             after = Some(last.id);
             for f in &page {
                 rdf::emit_fact(&mut sink, &names, &vocab, f, now)?;
+            }
+            yield axum::body::Bytes::from(buf.take());
+        }
+
+        // 证据游标是复合的 (fact_id, chunk_id)——与取数页同一键
+        let mut after: Option<(Uuid, Uuid)> = None;
+        loop {
+            let page = utopia_store::export::evidence_page(&mut tx, kb_id, after).await.map_err(io)?;
+            let Some(last) = page.last() else { break };
+            after = Some((last.fact_id, last.chunk_id));
+            for e in &page {
+                rdf::emit_evidence(&mut sink, &names, e)?;
             }
             yield axum::body::Bytes::from(buf.take());
         }
