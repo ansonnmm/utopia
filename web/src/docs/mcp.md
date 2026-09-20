@@ -242,7 +242,6 @@ review-time joins, not asserted ledger rows), and the
 themselves. Statement nodes carry `prov:wasDerivedFrom` to every citing
 document — the flattened convenience link — while the authoritative
 fact-to-chunk pairing is the `utopia:Evidence` node.
->>>>>>> 00bb113 (The export contract documents the whole ledger)
 
 MCP remains the agent-facing surface. The structured results below use the same
 UUIDs, so an integration can join a selected result to the exported ledger.
