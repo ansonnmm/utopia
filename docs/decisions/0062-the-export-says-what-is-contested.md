@@ -1,6 +1,6 @@
 # 0062 · The export says what is contested
 
-- **Status**: proposed · implements [#564](https://github.com/deeplethe/utopia/issues/564) · precondition: the current-ontology invariant described under [The `open` invariant](#the-open-invariant)
+- **Status**: accepted 2026-09-26 (#922) · implements [#564](https://github.com/deeplethe/utopia/issues/564) · precondition: the current-ontology invariant described under [The `open` invariant](#the-open-invariant)
 - **Written**: 2026-09-25 (conventions in the [README](README.md))
 - **Related**: [0020](0020-an-auditor-reads-it-without-us.md) (the export this extends); [0012](0012-the-ontology-is-a-contract-not-a-suggestion.md) (axiom violations); [0017](0017-a-contradiction-points-upstream.md) (`derived_contradiction`); [#550](https://github.com/deeplethe/utopia/issues/550) (the export is the supported machine-readable read contract); #612, #613, #618, #619 (the storage-side findings this record had to respect)
 
@@ -79,7 +79,7 @@ Two rules keep the link honest:
 
 The criterion link on an open row is only true if `open` means *reconciled against the current ontology*. Today's `update_relation_type` can change axioms, domain and range and return without reconciling, leaving open rows whose criterion no longer exists — a state every consumer of the table, not only the export, can observe. The invariant is therefore owned by ontology mutation, not by the exporter:
 
-**When an ontology edit changes a criterion the consistency check reads — axiom flags, `inverse_of`, `sub_property_of`, `temporal`, domain, range, or the class hierarchy — the same transaction closes the open violations whose criterion no longer applies with `resolution = 'criterion_changed'` and re-detects under the new ontology.** `criterion_changed` (migration `0081`) is recorded as a resolution but not an adjudication: `decided_by` stays empty. A row that was already stale under the old criterion — one no detection under it would have found — is deleted as before, not re-labelled.
+**When an ontology edit changes a criterion the consistency check reads — axiom flags, `inverse_of`, `sub_property_of`, `temporal`, domain, range, or the class hierarchy — the same transaction closes the open violations whose criterion no longer applies with `resolution = 'criterion_changed'` and re-detects under the new ontology.** `criterion_changed` (migration `0093`) is recorded as a resolution but not an adjudication: `decided_by` stays empty. A row that was already stale under the old criterion — one no detection under it would have found — is deleted as before, not re-labelled.
 
 Mechanically this is one detection pass before the write (the old-ontology baseline), the ontology write, and the existing detection + settle again, in one transaction. Rows a fresh detection no longer finds are partitioned against the baseline: found there → `criterion_changed`; absent there → gone. Reopened rows follow the existing rule — a `criterion_changed` row whose violation recurs reopens like `axiom_relaxed` does.
 
